@@ -7,13 +7,13 @@ import Foundation
 
 // MARK: - LocalP2PIdentity
 
-/// Identidad local observable. El nombre visible es editable por el usuario y se
-/// propaga al registro TXT de Bonjour y a los mensajes salientes.
+/// Observable local identity. The display name is user-editable and
+/// propagates to the Bonjour TXT record and outgoing messages.
 ///
-/// `applicationID` es responsabilidad de quien use el paquete: no es una
-/// credencial, se envía tal cual en el `hello` y nadie la verifica, así que
-/// sirve para identificar y deduplicar, no para autorizar frente a un peer
-/// malicioso.
+/// `applicationID` is the consumer's responsibility: it's not a credential,
+/// it's sent as-is in `hello` and nobody verifies it, so it's good for
+/// identifying and deduplicating peers, not for authorizing against a
+/// malicious one.
 @MainActor
 @Observable
 public final class LocalP2PIdentity {

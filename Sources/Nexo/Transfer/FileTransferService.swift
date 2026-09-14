@@ -1,8 +1,6 @@
 //
 //  FileTransferService.swift
-//  Project Dark
-//
-//  Created by Marcos del Castillo Camacho on 11/09/2026.
+//  Nexo
 //
 
 import CryptoKit
@@ -10,34 +8,34 @@ import Foundation
 
 // MARK: - FileTransferService
 
-/// Transferencia fiable de ficheros por chunks, con ámbito de room.
+/// Reliable, room-scoped file transfer by chunks.
 ///
-/// El fichero nunca se carga entero en memoria: se lee y se escribe por trozos
-/// con un `FileHandle`, y el receptor solo publica la URL final cuando el
-/// SHA-256 coincide con el de la oferta.
+/// The file is never loaded whole into memory: read and written in pieces
+/// via a `FileHandle`, and the receiver only publishes the final URL once the
+/// SHA-256 matches the one in the offer.
 @MainActor
 @Observable
 public final class FileTransferService {
 
-    // MARK: - Transferencias
+    // MARK: - Transfers
 
-    /// Envío en curso.
+    /// An upload in progress.
     @MainActor
     fileprivate final class Upload {
         let offer: FileOffer
         let sourceURL: URL
         let recipients: [String]
-        /// Fuente temporal creada para preparar el envío, si existe. La copia
-        /// estable del adjunto vive mientras el mensaje pueda necesitarla.
+        /// Temporary source created to prepare the send, if any. The stable
+        /// copy of the attachment lives as long as the message may need it.
         let temporarySourceURL: URL?
         var handle: FileHandle?
         var nextChunkIndex = 0
         var pumpTask: Task<Void, Never>?
 
-        /// Último chunk confirmado por cada receptor. La ventana se calcula sobre
-        /// el más lento: usar el más rápido dejaría a los demás sin datos.
+        /// Last chunk acknowledged by each recipient. The window is computed
+        /// on the slowest one: using the fastest would starve the rest.
         var acknowledgedIndexes: [String: Int] = [:]
-        /// Receptores que ya han validado el fichero completo.
+        /// Recipients that have already validated the full file.
         var completedRecipients: Set<String> = []
 
         init(
@@ -52,7 +50,7 @@ public final class FileTransferService {
             self.temporarySourceURL = temporarySourceURL
         }
 
-        /// Progreso confirmado por el receptor más lento.
+        /// Progress acknowledged by the slowest recipient.
         var slowestAcknowledgedIndex: Int {
             guard !recipients.isEmpty else { return offer.chunkCount - 1 }
             return recipients.map { acknowledgedIndexes[$0] ?? -1 }.min() ?? -1
@@ -63,7 +61,7 @@ public final class FileTransferService {
         }
     }
 
-    /// Recepción en curso.
+    /// A download in progress.
     @MainActor
     fileprivate final class Download {
         let offer: FileOffer
@@ -80,16 +78,16 @@ public final class FileTransferService {
         }
     }
 
-    // MARK: - Estado observable
+    // MARK: - Observable state
 
-    /// Estado por `transferID`, tanto de envíos como de recepciones.
+    /// State keyed by `transferID`, for both uploads and downloads.
     public private(set) var states: [UUID: FileTransferState] = [:]
-    /// Ficheros recibidos correctamente y disponibles en disco.
+    /// Files successfully received and available on disk.
     public private(set) var receivedFiles: [UUID: URL] = [:]
-    /// Copia local estable asociada a cada adjunto del chat, tanto propio como recibido.
+    /// Stable local copy for each chat attachment, whether sent or received.
     private var localFiles: [UUID: URL] = [:]
 
-    // MARK: - Estado interno
+    // MARK: - Internal state
 
     private var uploads: [UUID: Upload] = [:]
     private var downloads: [UUID: Download] = [:]
@@ -97,9 +95,9 @@ public final class FileTransferService {
     private let identity: LocalP2PIdentity
     private unowned let coordinator: RoomCoordinator
 
-    /// Temporales de preparación y archivos incompletos de una recepción.
+    /// Staging temporaries and incomplete files for an in-progress download.
     private let inboxDirectory: URL
-    /// Caché estable para que la burbuja y el visor no dependan del temporal de origen.
+    /// Stable cache so the chat bubble and viewer don't depend on the source temporary.
     private let attachmentDirectory: URL
 
     // MARK: - Init
@@ -128,9 +126,9 @@ public final class FileTransferService {
         )
     }
 
-    // MARK: - Envío
+    // MARK: - Sending
 
-    /// Oferta un fichero del disco a los miembros de la room.
+    /// Offers a file from disk to the room's members.
     @discardableResult
     public func offer(
         fileURL: URL,
@@ -195,8 +193,8 @@ public final class FileTransferService {
             channel: .fileTransfer
         )
 
-        // Sin destinatarios no hay nada que transferir, pero el adjunto local sí
-        // debe quedar visible en el chat.
+        // With no recipients there's nothing to transfer, but the local
+        // attachment still needs to show up in chat.
         if recipients.isEmpty {
             uploads.removeValue(forKey: offer.transferID)
             states[offer.transferID] = .completed(url: stableURL)
@@ -213,7 +211,7 @@ public final class FileTransferService {
         )
     }
 
-    /// Oferta datos en memoria escribiéndolos primero en un temporal.
+    /// Offers in-memory data by first writing it to a temporary file.
     @discardableResult
     public func offer(
         data: Data,
@@ -272,9 +270,9 @@ public final class FileTransferService {
         update(transferID, state: .cancelled, in: session)
     }
 
-    // MARK: - Recepción
+    // MARK: - Receiving
 
-    /// Punto de entrada del canal `.fileTransfer`.
+    /// Entry point for the `.fileTransfer` channel.
     public func handle(envelope: RoomEnvelope, from member: RoomMember, in session: RoomSession) {
         guard let message = try? envelope.decodePayload(as: FileTransferMessage.self) else { return }
 
@@ -283,7 +281,7 @@ public final class FileTransferService {
             accept(offer: offer, from: member, in: session)
 
         case .accept(let control):
-            // Solo un destinatario de esta oferta puede aceptarla.
+            // Only a recipient of this offer can accept it.
             guard uploads[control.transferID]?.recipients.contains(member.applicationID) == true
             else { return }
             startPumping(control.transferID, in: session)
@@ -306,15 +304,15 @@ public final class FileTransferService {
             guard let upload = uploads[control.transferID],
                   upload.recipients.contains(member.applicationID) else { return }
             upload.completedRecipients.insert(member.applicationID)
-            // No se cierra al primer receptor que acaba: los demás se quedarían
-            // sin los chunks que falten.
+            // Don't close on the first recipient to finish: the others would
+            // be left missing chunks.
             guard upload.hasFinishedForEveryone else { return }
             finishUpload(upload, in: session)
         }
     }
 
-    /// `true` si el miembro participa en esa transferencia, como destinatario de
-    /// nuestro envío o como emisor de nuestra descarga.
+    /// `true` if the member is a counterparty of this transfer, either as a
+    /// recipient of our upload or the sender of our download.
     private func isCounterparty(_ member: RoomMember, of transferID: UUID) -> Bool {
         if let upload = uploads[transferID] {
             return upload.recipients.contains(member.applicationID)
@@ -329,8 +327,8 @@ public final class FileTransferService {
         states[transferID]
     }
 
-    /// URL local estable del adjunto, tanto si lo envió este dispositivo como si
-    /// terminó de recibirse desde la room.
+    /// Stable local URL for the attachment, whether this device sent it or
+    /// finished receiving it from the room.
     public func localFileURL(for transferID: UUID) -> URL? {
         guard let url = localFiles[transferID] ?? receivedFiles[transferID],
               FileManager.default.fileExists(atPath: url.path) else {
@@ -339,13 +337,13 @@ public final class FileTransferService {
         return url
     }
 
-    /// API de compatibilidad para consumidores que solo buscan recepciones.
+    /// Compatibility API for consumers that only care about downloads.
     public func receivedFileURL(for transferID: UUID) -> URL? {
         localFileURL(for: transferID)
     }
 }
 
-// MARK: - Envío por chunks
+// MARK: - Sending by chunks
 
 @MainActor
 private extension FileTransferService {
@@ -361,8 +359,8 @@ private extension FileTransferService {
             return
         }
 
-        // El progreso no se reinicia al rellenar la ventana: se recalcula desde
-        // los chunks ya enviados.
+        // Progress isn't reset when refilling the window: it's recomputed
+        // from the chunks already sent.
         update(
             transferID,
             state: .transferring(
@@ -375,8 +373,8 @@ private extension FileTransferService {
             defer { upload.pumpTask = nil }
 
             while !Task.isCancelled, upload.nextChunkIndex < upload.offer.chunkCount {
-                // Backpressure: no se adelanta más de una ventana sobre lo que ha
-                // confirmado el receptor más lento.
+                // Backpressure: never get more than one window ahead of what
+                // the slowest recipient has acknowledged.
                 let inFlight = upload.nextChunkIndex - upload.slowestAcknowledgedIndex - 1
                 guard inFlight < P2PLimits.transferWindowChunks else { return }
 
@@ -411,7 +409,7 @@ private extension FileTransferService {
                     in: session
                 )
 
-                // Cede el turno para que la UI y las otras lanes respiren.
+                // Yields so the UI and other lanes get a turn.
                 await Task.yield()
             }
         }
@@ -458,7 +456,7 @@ private extension FileTransferService {
     }
 }
 
-// MARK: - Recepción por chunks
+// MARK: - Receiving by chunks
 
 @MainActor
 private extension FileTransferService {
@@ -524,8 +522,8 @@ private extension FileTransferService {
               download.senderApplicationID == member.applicationID,
               let handle = download.handle else { return }
 
-        // Solo se acepta el chunk siguiente: TCP conserva el orden y así se
-        // detecta cualquier hueco sin tener que reordenar en memoria.
+        // Only the next chunk is accepted: TCP preserves order, so this
+        // detects any gap without needing to reorder in memory.
         guard chunk.index == download.nextExpectedIndex else { return }
 
         do {
@@ -614,7 +612,7 @@ private extension FileTransferService {
     }
 }
 
-// MARK: - Utilidades
+// MARK: - Utilities
 
 @MainActor
 private extension FileTransferService {
@@ -624,12 +622,12 @@ private extension FileTransferService {
         session.chat?.updateTransfer(transferID, state: state)
     }
 
-    /// El emisor de la room. Se obtiene del coordinador para no duplicar estado.
+    /// The room's sender, fetched from the coordinator to avoid duplicating state.
     func outbox(for session: RoomSession) -> RoomOutbox? {
         coordinator.outbox(for: session.roomID)
     }
 
-    /// SHA-256 en streaming: no carga el fichero completo en memoria.
+    /// Streaming SHA-256: never loads the whole file into memory.
     static func checksum(of url: URL) throws -> String {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }

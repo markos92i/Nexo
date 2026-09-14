@@ -1,44 +1,40 @@
 //
 //  RoomControlMessage.swift
-//  Project Dark
-//
-//  Created by Marcos del Castillo Camacho on 11/09/2026.
+//  Nexo
 //
 
 import Foundation
 
 // MARK: - RoomControlMessage
 
-/// Mensajes del canal `.control`. Gobiernan el directorio, la membresía de rooms
-/// y el ciclo de vida de las actividades.
+/// Messages on the `.control` channel. Govern the directory, room membership
+/// and activity lifecycle.
 ///
-/// La aprobación de entrada a una room y la aceptación de participar en una
-/// actividad son operaciones distintas y tienen mensajes distintos.
+/// Approving entry to a room and accepting participation in an activity are
+/// distinct operations with distinct messages.
 public enum RoomControlMessage: Codable, Sendable {
 
-    // MARK: Directorio
+    // MARK: Directory
 
-    /// Respuesta con el catálogo completo de rooms que hospeda el emisor.
-    /// El registro TXT solo cabe unas pocas, así que el directorio real se pide
-    /// después del handshake.
+    /// Response with the sender's full room catalog. The TXT record only fits
+    /// a few, so the real directory is requested after the handshake.
     case roomDirectory(RoomDirectoryPayload)
-    /// Petición explícita del directorio del peer.
     case roomDirectoryRequest
 
-    // MARK: Membresía
+    // MARK: Membership
 
     case joinRoomRequest(JoinRoomRequestPayload)
     case joinRoomAccepted(JoinRoomAcceptedPayload)
     case joinRoomRejected(JoinRoomRejectedPayload)
     case leaveRoom(LeaveRoomPayload)
     case roomMembershipChanged(RoomMembershipPayload)
-    /// Snapshot autoritativo enviado por el host al restablecer una conexión.
+    /// Authoritative snapshot sent by the host when a connection is restored.
     case roomResume(RoomResumePayload)
-    /// Historial de chat, enviado en chunks para completar el snapshot corto.
+    /// Chat history, sent in chunks to complete the short resume snapshot.
     case chatHistory(ChatHistoryPayload)
     case roomClosed(RoomClosedPayload)
 
-    // MARK: Actividades
+    // MARK: Activities
 
     case activityStarted(ActivityLifecyclePayload)
     case activityInvite(ActivityLifecyclePayload)
@@ -66,8 +62,8 @@ public struct JoinRoomRequestPayload: Codable, Sendable {
 public struct JoinRoomAcceptedPayload: Codable, Sendable {
     public let descriptor: RoomDescriptor
     public let members: [RoomMember]
-    /// Actividades ya vivas en la room, para que el recién llegado pueda
-    /// incorporarse o al menos mostrarlas.
+    /// Activities already live in the room, so the newcomer can join or at
+    /// least see them.
     public let activities: [ActivityDescriptor]
 }
 
@@ -85,8 +81,8 @@ public struct RoomMembershipPayload: Codable, Sendable {
     public let members: [RoomMember]
 }
 
-/// Estado autoritativo de una room para recuperar una conexión que estuvo caída.
-/// El host es la única fuente de verdad de membresía y actividades.
+/// Authoritative room state used to recover a connection that was down. The
+/// host is the single source of truth for membership and activities.
 public struct RoomResumePayload: Codable, Sendable {
     public let descriptor: RoomDescriptor
     public let members: [RoomMember]
@@ -94,8 +90,8 @@ public struct RoomResumePayload: Codable, Sendable {
     public let chatMessages: [ChatMessage]
 }
 
-/// Un chunk de historial de chat. El `roomID` se repite deliberadamente dentro
-/// del payload para validar el contenido además del envelope de control.
+/// A chunk of chat history. `roomID` is deliberately repeated inside the
+/// payload to validate content in addition to the control envelope.
 public struct ChatHistoryPayload: Codable, Sendable {
     public let roomID: RoomID
     public let messages: [ChatMessage]

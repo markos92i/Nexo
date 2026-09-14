@@ -1,17 +1,14 @@
 //
 //  ActivityModels.swift
-//  Project Dark
-//
-//  Created by Marcos del Castillo Camacho on 11/09/2026.
+//  Nexo
 //
 
 import Foundation
 
 // MARK: - ActivityID
 
-/// Identificador de una actividad concreta dentro de una room. Una room puede
-/// tener varias actividades vivas y una actividad puede repetirse (revancha)
-/// con un identificador nuevo.
+/// Identifies one activity instance within a room. A room can host several
+/// live activities, and a rematch gets a new ID.
 public struct ActivityID: Hashable, Codable, Sendable, Identifiable, CustomStringConvertible {
     public let rawValue: UUID
 
@@ -25,12 +22,12 @@ public struct ActivityID: Hashable, Codable, Sendable, Identifiable, CustomStrin
 
 // MARK: - ActivityKind
 
-/// Identificador abierto de un tipo de actividad.
+/// Open identifier for an activity type.
 ///
-/// El paquete no conoce ningún juego concreto: cada juego declara su propio
-/// `static let` en su propio módulo, p. ej. `extension ActivityKind { static
-/// let sudoku = ActivityKind("sudoku") }`. Título, icono y demás metadatos de
-/// presentación viven en el catálogo de la app, nunca aquí.
+/// Nexo ships none: each game declares its own `static let` in its own module,
+/// e.g. `extension ActivityKind { static let sudoku = ActivityKind("sudoku") }`.
+/// Title, icon and other presentation metadata belong in the app's catalog,
+/// never here.
 public struct ActivityKind: RawRepresentable, Hashable, Codable, Sendable, Identifiable {
     public let rawValue: String
 
@@ -48,34 +45,31 @@ public struct ActivityKind: RawRepresentable, Hashable, Codable, Sendable, Ident
 // MARK: - ActivityState
 
 public enum ActivityState: String, Codable, Sendable {
-    /// Creada, admitiendo participantes.
     case lobby
-    /// En curso.
     case running
-    /// Terminada; la UI muestra el resultado antes de destruirla.
+    /// Finished; the UI shows the result before it's torn down.
     case finished
-    /// Cancelada por el host o por falta de participantes.
     case cancelled
 }
 
 // MARK: - ActivityDescriptor
 
-/// Descripción transportable de una actividad.
+/// Transportable description of an activity.
 public struct ActivityDescriptor: Codable, Hashable, Sendable, Identifiable {
     public let id: ActivityID
     public let roomID: RoomID
     public let kind: ActivityKind
-    /// Autoridad de la actividad. Puede no ser el host de la room.
+    /// Authority for this activity. May differ from the room's host.
     public let hostApplicationID: String
     public var participantIDs: Set<String>
     public var state: ActivityState
-    /// `true` si la actividad se abrió a toda la room, de modo que quien entre
-    /// después se incorpora automáticamente mientras siga en `.lobby`.
-    /// `false` cuando el host eligió a dedo a los participantes.
+    /// `true` if open to the whole room, so members who join later are
+    /// auto-admitted while still `.lobby`. `false` if the host hand-picked
+    /// the participants.
     public let admitsRoomMembers: Bool
-    /// `true` si solo puede haber una instancia activa de esta clase a la vez en
-    /// la room (un juego). `false` si puede convivir con cualquier otra
-    /// actividad activa (p. ej. un chat).
+    /// `true` if only one instance of this kind can be active at a time in the
+    /// room (a game). `false` if it can run alongside any other active
+    /// activity (e.g. chat).
     public let isExclusive: Bool
 
     public init(
@@ -98,7 +92,7 @@ public struct ActivityDescriptor: Codable, Hashable, Sendable, Identifiable {
         self.isExclusive = isExclusive
     }
 
-    /// Decodificación tolerante para peers que no envíen los campos nuevos.
+    /// Lenient decoding for peers that don't send the newer fields.
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(ActivityID.self, forKey: .id)

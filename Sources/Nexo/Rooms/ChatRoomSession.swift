@@ -1,8 +1,6 @@
 //
 //  ChatRoomSession.swift
-//  Project Dark
-//
-//  Created by Marcos del Castillo Camacho on 11/09/2026.
+//  Nexo
 //
 
 import Foundation
@@ -11,17 +9,17 @@ import Foundation
 
 public enum ChatMessageKind: String, Codable, Sendable {
     case text
-    /// Aviso generado localmente (entradas, salidas, cierre de sala).
+    /// Locally generated notice (joins, leaves, room closed).
     case systemInfo
-    /// Mensaje con un adjunto. El contenido llega por el canal de transferencia.
+    /// Message with an attachment. Content arrives over the transfer channel.
     case attachment
 }
 
 // MARK: - ChatActivityInvitation
 
-/// Referencia a una actividad ya creada que se presenta como una invitación en
-/// el chat. El anuncio de control sigue siendo la autoridad de la actividad;
-/// este payload solo permite conservarla y representarla como una burbuja.
+/// Reference to an already-created activity, presented as a chat invitation.
+/// The control announcement remains the activity's authority; this payload
+/// only keeps a reference to render it as a bubble.
 public struct ChatActivityInvitation: Codable, Sendable, Hashable {
     public let activityID: ActivityID
     public let roomID: RoomID
@@ -36,10 +34,10 @@ public struct ChatActivityInvitation: Codable, Sendable, Hashable {
 
 // MARK: - ChatAttachment
 
-/// Metadatos del adjunto que viajan en el mensaje de chat.
+/// Attachment metadata carried in a chat message.
 ///
-/// El contenido **no** viaja aquí: solo la descripción y el `transferID` con el
-/// que emparejar los chunks del canal `.fileTransfer`.
+/// Content does **not** travel here: only the description and the
+/// `transferID` used to match chunks on the `.fileTransfer` channel.
 public struct ChatAttachment: Codable, Sendable, Hashable {
     public let transferID: UUID
     public let fileName: String
@@ -68,8 +66,7 @@ public struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
     public var body: String
     public let kind: ChatMessageKind
     public var attachment: ChatAttachment?
-    /// Invitación opcional. Al ser opcional, los mensajes de peers antiguos
-    /// siguen decodificando como mensajes de texto normales.
+    /// Optional, so messages from older peers still decode as plain text.
     public var invitation: ChatActivityInvitation?
     public let timestamp: Date
 
@@ -114,29 +111,28 @@ public struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
 
 // MARK: - ChatRoomSession
 
-/// Chat de una room concreta.
+/// Chat for one specific room.
 ///
-/// Solo existe si la room declara `RoomFeatures.chat`, así que una room de solo
-/// juego no arrastra historial ni UI de chat.
+/// Only exists if the room declares `RoomFeatures.chat`, so a game-only room
+/// carries no chat history or UI.
 @MainActor
 @Observable
 public final class ChatRoomSession {
 
     public let roomID: RoomID
 
-    // MARK: - Estado
+    // MARK: - State
 
     public private(set) var messages: [ChatMessage] = []
-    /// Transferencias vivas asociadas a mensajes de este chat.
+    /// Live transfers associated with this chat's messages.
     public private(set) var transfers: [UUID: FileTransferState] = [:]
 
     private let outbox: RoomOutbox
     private let identity: LocalP2PIdentity
-    /// Identificadores ya vistos: el mismo mensaje puede llegar por reenvío.
-    /// Se conserva independientemente de la ventana visual para que un replay
-    /// antiguo no vuelva a insertar un mensaje ya descartado de `messages`.
-    /// Los IDs que ya no son visibles se conservan solo durante la ventana de
-    /// recuperación y hasta el límite del journal.
+    /// IDs already seen: the same message can arrive again via replay. Kept
+    /// independently of the visible window so an old replay never reinserts a
+    /// message already dropped from `messages`. IDs no longer visible are kept
+    /// only for the recovery window and up to the journal limit.
     private var seenMessageIDs: Set<UUID> = []
     private var seenMessageDates: [UUID: Date] = [:]
 
@@ -148,15 +144,15 @@ public final class ChatRoomSession {
         self.identity = identity
     }
 
-    // MARK: - Envío
+    // MARK: - Sending
 
     public func send(text: String) {
         send(text: text, invitation: nil)
     }
 
-    /// Publica un texto o una invitación de actividad. La actividad debe haberse
-    /// creado previamente por el coordinador, que sigue siendo la autoridad
-    /// para sus participantes y estado.
+    /// Publishes text or an activity invitation. The activity must already
+    /// have been created by the coordinator, which remains the authority for
+    /// its participants and state.
     public func send(text: String, invitation: ChatActivityInvitation?) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || invitation != nil else { return }
@@ -174,8 +170,8 @@ public final class ChatRoomSession {
         outbox.send(message, channel: .chat)
     }
 
-    /// Publica el mensaje que acompaña a un adjunto. El contenido lo mueve
-    /// `FileTransferService` por su propio canal.
+    /// Publishes the message that accompanies an attachment. Content is
+    /// moved by `FileTransferService` on its own channel.
     public func send(attachment: ChatAttachment, caption: String) {
         let message = ChatMessage(
             roomID: roomID,
@@ -191,33 +187,33 @@ public final class ChatRoomSession {
         outbox.send(message, channel: .chat)
     }
 
-    // MARK: - Recepción
+    // MARK: - Receiving
 
     public func receive(payload: Data, from member: RoomMember) {
         guard var message = try? P2PCoder.decode(ChatMessage.self, from: payload) else { return }
 
-        // El emisor declarado debe coincidir con el peer conocido por la room,
-        // y el mensaje debe pertenecer a esta room.
+        // The declared sender must match the peer known to the room, and the
+        // message must belong to this room.
         guard message.senderApplicationID == member.applicationID,
               message.roomID == roomID else { return }
 
-        // Un mensaje normal no puede transportar metadatos de adjunto, y un
-        // mensaje de adjunto debe declarar la oferta que lo acompaña. Una
-        // invitación y un adjunto tampoco son la misma clase de mensaje.
+        // A plain message can't carry attachment metadata, and an attachment
+        // message must declare its offer. An invitation and an attachment
+        // aren't the same kind of message either.
         if message.kind == .attachment {
             guard message.attachment != nil, message.invitation == nil else { return }
         } else {
             guard message.attachment == nil else { return }
         }
 
-        // La invitación es solo una referencia visual. Si llega apuntando a
-        // otra room, se conserva el texto pero se descarta la acción.
+        // The invitation is just a visual reference. If it points to another
+        // room, keep the text but drop the action.
         if let invitation = message.invitation, invitation.roomID != roomID {
             message.invitation = nil
         }
 
-        // El nombre visible es el que conoce la room, no el que venga incrustado
-        // en el payload enviado por el peer.
+        // The display name is the one the room knows, not whatever the peer
+        // embedded in the payload.
         message.senderDisplayName = member.displayName
         message.body = String(message.body.prefix(4_000))
         append(message)
@@ -227,8 +223,8 @@ public final class ChatRoomSession {
         }
     }
 
-    /// Mezcla el historial enviado por el host durante la reanudación. La
-    /// deduplicación por UUID hace que sea seguro combinarlo con el replay.
+    /// Merges history sent by the host during resume. UUID deduplication
+    /// makes it safe to combine with replay.
     public func merge(messages: [ChatMessage]) -> Bool {
         var didChange = false
 
@@ -250,7 +246,7 @@ public final class ChatRoomSession {
         return didChange
     }
 
-    // MARK: - Sistema y presencia
+    // MARK: - System messages & presence
 
     public func appendSystemMessage(_ body: String) {
         append(.system(roomID: roomID, body: body))
@@ -264,7 +260,7 @@ public final class ChatRoomSession {
         appendSystemMessage("\(member.displayName) ha salido.")
     }
 
-    // MARK: - Transferencias
+    // MARK: - Transfers
 
     public func updateTransfer(_ transferID: UUID, state: FileTransferState) {
         transfers[transferID] = state
@@ -289,6 +285,7 @@ public final class ChatRoomSession {
 
     // MARK: - Private Helpers
 
+    @discardableResult
     private func append(_ message: ChatMessage) -> Bool {
         pruneSeenMessageIDs()
         guard seenMessageIDs.insert(message.id).inserted else { return false }

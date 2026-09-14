@@ -1,45 +1,43 @@
 //
 //  TransportSendQueue.swift
-//  Project Dark
-//
-//  Created by Marcos del Castillo Camacho on 11/09/2026.
+//  Nexo
 //
 
 import Foundation
 
 // MARK: - TransportSendQueue
 
-/// Cola de envío de una conexión física.
+/// Send queue for one physical connection.
 ///
-/// Resuelve dos problemas que TCP no resuelve por sí solo:
+/// Solves two problems TCP doesn't solve on its own:
 ///
-/// 1. **Lanes.** Una transferencia de imagen no debe retrasar una orden de juego
-///    ni un mensaje de membresía. La cola drena siempre por prioridad de lane.
-/// 2. **Coalescing latest-wins.** Los snapshots de tablero son estado completo y
-///    sustituible: si uno todavía está en la cola cuando llega el siguiente, se
-///    reemplaza en su posición. Así un snapshot viejo nunca ocupa sitio delante
-///    de un `finishOrder` y no se acumula backlog al saturarse el enlace.
+/// 1. **Lanes.** An image transfer must not delay a game order or a
+///    membership message. The queue always drains by lane priority.
+/// 2. **Latest-wins coalescing.** Board snapshots are full, replaceable
+///    state: if one is still queued when the next arrives, it's replaced in
+///    place. This way a stale snapshot never sits ahead of a `finishOrder`,
+///    and no backlog builds up when the link saturates.
 @MainActor
 public final class TransportSendQueue {
 
     public typealias Sender = @MainActor (RoomEnvelope) async throws -> Void
     public typealias FailureHandler = @MainActor (Error) -> Void
 
-    // MARK: - Estado
+    // MARK: - State
 
     private var lanes: [TransportLane: [RoomEnvelope]] = [:]
     private var drainTask: Task<Void, Never>?
     private var isStopped = false
 
-    /// Envíos consecutivos servidos desde lanes por encima de `.transfer`. Evita
-    /// que un flujo continuo de snapshots deje una transferencia sin avanzar.
+    /// Consecutive sends served from lanes above `.transfer`. Stops a
+    /// continuous stream of snapshots from starving a transfer.
     private var consecutiveNonTransferSends = 0
     private let transferStarvationGuard = 12
 
     private let send: Sender
     private let onFailure: FailureHandler
 
-    /// Envelopes pendientes en todas las lanes.
+    /// Pending envelopes across every lane.
     public var pendingCount: Int { lanes.values.reduce(0) { $0 + $1.count } }
 
     // MARK: - Init
@@ -59,7 +57,7 @@ public final class TransportSendQueue {
         if envelope.deliveryMode == .unreliable,
            let key = envelope.coalescingKey,
            let existingIndex = lanes[lane]?.firstIndex(where: { $0.coalescingKey == key }) {
-            // Latest-wins: se conserva la posición para no reordenar la lane.
+            // Latest-wins: keep the position so the lane doesn't get reordered.
             lanes[lane]?[existingIndex] = envelope
         } else {
             lanes[lane, default: []].append(envelope)
@@ -68,7 +66,7 @@ public final class TransportSendQueue {
         startDrainingIfNeeded()
     }
 
-    /// Descarta lo pendiente y detiene el drenado. La conexión se cierra aparte.
+    /// Discards anything pending and stops draining. The connection itself is closed separately.
     public func stop() {
         isStopped = true
         drainTask?.cancel()
@@ -123,9 +121,9 @@ public final class TransportSendQueue {
         return nil
     }
 
-    /// Orden de inspección de lanes para el siguiente envío. Normalmente es la
-    /// prioridad natural; cuando se alcanza el umbral de inanición, `.transfer`
-    /// pasa al frente para que la transferencia progrese.
+    /// Order in which lanes are inspected for the next send. Normally natural
+    /// priority; once the starvation threshold is hit, `.transfer` moves to
+    /// the front so the transfer can progress.
     private func nextLaneOrder() -> [TransportLane] {
         let naturalOrder = TransportLane.allCases.sorted()
 

@@ -1,55 +1,53 @@
 //
 //  PeerTransport.swift
-//  Project Dark
-//
-//  Created by Marcos del Castillo Camacho on 11/09/2026.
+//  Nexo
 //
 
 import Foundation
 
 // MARK: - PeerTransport
 
-/// Contrato del transporte físico, independiente de Network Framework.
+/// Contract for the physical transport, independent of Network framework.
 ///
-/// El transporte no sabe qué es una room: solo descubre dispositivos, mantiene
-/// una conexión por peer y entrega envelopes opacos. Todo el enrutamiento lógico
-/// vive en `RoomCoordinator`.
+/// The transport doesn't know what a room is: it only discovers devices,
+/// keeps one connection per peer, and delivers opaque envelopes. All logical
+/// routing lives in `RoomCoordinator`.
 @MainActor
 public protocol PeerTransport: AnyObject {
 
-    /// Flujo único de eventos. Tiene un solo consumidor: `P2PConnectivityManager`.
+    /// Single event stream. Has one consumer: the app's connectivity manager.
     var events: AsyncStream<PeerTransportEvent> { get }
 
-    /// Época vigente. Se incrementa en cada `start`/`stop` para descartar
-    /// eventos de una sesión anterior.
+    /// Current epoch. Incremented on every `start`/`stop` to discard events
+    /// from a previous session.
     var epoch: UInt64 { get }
 
-    /// Peers con handshake completado, indexados por `applicationID`.
+    /// Peers with a completed handshake, indexed by `applicationID`.
     var connectedPeers: [ConnectedPeer] { get }
 
-    // MARK: Ciclo de vida
+    // MARK: Lifecycle
 
     func start(advertising: Bool, browsing: Bool)
     func stop()
 
-    /// Actualiza el registro TXT publicado sin reiniciar el listener, de modo que
-    /// cambiar de rooms no corta las conexiones abiertas.
+    /// Updates the published TXT record without restarting the listener, so
+    /// switching rooms never drops open connections.
     func updateAdvertisement(_ record: AdvertisementRecord)
 
-    // MARK: Conexiones
+    // MARK: Connections
 
-    /// Abre una conexión con el anuncio indicado, o reutiliza la existente si ya
-    /// hay una conexión viva con ese `applicationID`.
+    /// Opens a connection to the given advertisement, or reuses an existing
+    /// live connection to that `applicationID`.
     @discardableResult
     func connect(to advertisement: PeerAdvertisement) async throws -> ConnectedPeer
 
-    /// Cierra la conexión física con un peer. Solo debe usarla el manager: salir
-    /// de una room nunca cierra la conexión.
+    /// Closes the physical connection to a peer. Only the manager should call
+    /// this: leaving a room never closes the connection.
     func disconnect(applicationID: String, reason: String?)
 
-    // MARK: Envío
+    // MARK: Sending
 
-    /// Encola un envelope hacia un peer concreto. El envío es asíncrono y
-    /// respeta las lanes y el coalescing configurados en el envelope.
+    /// Queues an envelope for a specific peer. Sending is asynchronous and
+    /// respects the lanes and coalescing configured on the envelope.
     func enqueue(_ envelope: RoomEnvelope, to applicationID: String)
 }

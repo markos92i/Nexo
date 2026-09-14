@@ -1,27 +1,25 @@
 //
 //  P2PFrame.swift
-//  Project Dark
-//
-//  Created by Marcos del Castillo Camacho on 11/09/2026.
+//  Nexo
 //
 
 import Foundation
 
 // MARK: - P2PFrame
 
-/// Unidad que viaja realmente por el socket.
+/// The unit that actually travels over the socket.
 ///
-/// Es una estructura plana con un `kind` y cuerpos opcionales en vez de un enum
-/// con valores asociados: así el JSON tiene una sola capa y los cuerpos de
-/// control no acaban anidados ni en base64.
+/// A flat struct with a `kind` and optional bodies instead of an enum with
+/// associated values, so the JSON has a single layer and control bodies never
+/// end up nested or base64-encoded.
 public struct P2PFrame: Codable, Sendable {
 
     public enum Kind: String, Codable, Sendable {
-        /// Presentación e intercambio de identidad y capacidades.
+        /// Identity and capability exchange.
         case hello
-        /// Envelope de aplicación ya enrutable por room.
+        /// An application envelope, already routable by room.
         case envelope
-        /// Cierre ordenado. Evita que el peer tenga que esperar un timeout.
+        /// Orderly close, so the peer doesn't have to wait out a timeout.
         case goodbye
     }
 
@@ -47,11 +45,11 @@ public struct P2PFrame: Codable, Sendable {
 
 // MARK: - HelloBody
 
-/// Identidad declarada por el peer.
+/// Identity declared by the peer.
 ///
-/// No hay autenticación: `applicationID` es un identificador que el remoto envía
-/// sobre sí mismo y nadie verifica. Basta para identificar y deduplicar peers en
-/// una red local de confianza, pero no impide que un peer se haga pasar por otro.
+/// There's no authentication: `applicationID` is self-declared by the remote
+/// and nobody verifies it. Enough to identify and deduplicate peers on a
+/// trusted local network, but it doesn't stop a peer from impersonating another.
 public struct HelloBody: Codable, Sendable {
     public let protocolVersion: UInt8
     public let minimumProtocolVersion: UInt8

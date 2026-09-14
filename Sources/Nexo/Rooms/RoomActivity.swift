@@ -1,36 +1,34 @@
 //
 //  RoomActivity.swift
-//  Project Dark
-//
-//  Created by Marcos del Castillo Camacho on 11/09/2026.
+//  Nexo
 //
 
 import Foundation
 
 // MARK: - RoomActivity
 
-/// Una actividad es algo que ocurre *dentro* de una room, no una room aparte.
+/// An activity is something that happens *inside* a room, not a room of its own.
 ///
-/// El transporte y el `RoomCoordinator` tratan su payload como opaco: cada
-/// actividad define y decodifica sus propios mensajes. Añadir un juego nuevo no
-/// toca ninguna capa inferior.
+/// The transport and `RoomCoordinator` treat its payload as opaque: each
+/// activity defines and decodes its own messages. Adding a new game never
+/// touches a lower layer.
 @MainActor
 public protocol RoomActivity: AnyObject {
 
     var descriptor: ActivityDescriptor { get }
 
-    /// Payload del canal `.activity` dirigido a esta actividad.
+    /// Payload on the `.activity` channel addressed to this activity.
     func receive(payload: Data, from member: RoomMember)
 
-    /// Un participante entra o sale de la actividad, sin abandonar la room.
+    /// A participant joins or leaves the activity without leaving the room.
     func participantDidJoin(_ member: RoomMember)
     func participantDidLeave(_ member: RoomMember)
 
-    /// La actividad termina. Solo se destruye la actividad: la room y su chat
-    /// siguen vivos.
+    /// The activity ends. Only the activity is destroyed; the room and its
+    /// other activities stay alive.
     func activityDidEnd(reason: String)
 
-    /// Refleja un descriptor actualizado recibido del host.
+    /// Applies an updated descriptor received from the host.
     func apply(descriptor: ActivityDescriptor)
 }
 
@@ -46,23 +44,22 @@ public extension RoomActivity {
 
 // MARK: - ActivityContext
 
-/// Todo lo que una actividad necesita para funcionar, ya acotado a su room.
+/// Everything an activity needs to function, already scoped to its room.
 public struct ActivityContext {
     public let descriptor: ActivityDescriptor
     public let identity: LocalP2PIdentity
-    /// Emisor de la room. La actividad envía siempre con su propio `activityID`.
+    /// The room's sender. The activity always sends with its own `activityID`.
     public let outbox: RoomOutbox
-    /// Miembros vivos de la room, resuelto en cada consulta.
+    /// Live room members, resolved on every query.
     public let members: @MainActor () -> [RoomMember]
 
-    /// `true` si el usuario local manda en esta actividad.
+    /// `true` if the local user is authoritative for this activity.
     public var isLocalHost: Bool {
         descriptor.hostApplicationID == identity.applicationID
     }
 
-    /// Participantes de la actividad excluyendo al usuario local. El descriptor
-    /// se recibe de la actividad porque puede cambiar cuando se incorporan
-    /// miembros nuevos a una actividad abierta.
+    /// Activity participants excluding the local user. `descriptor` is passed
+    /// in because it can change as new members join an open activity.
     @MainActor
     public func participants(for descriptor: ActivityDescriptor) -> [RoomMember] {
         members().filter {
@@ -73,11 +70,11 @@ public struct ActivityContext {
 
 // MARK: - RoomActivityRegistry
 
-/// Fábrica de actividades por tipo.
+/// Factory of activities by kind.
 ///
-/// Es el punto de extensión para juegos futuros: se registra una factoría al
-/// arrancar y el `RoomCoordinator` puede instanciar la actividad correcta al
-/// recibir un `activityStarted`, sin conocer ningún juego concreto.
+/// This is the extension point for future games: register a factory at
+/// launch, and `RoomCoordinator` can instantiate the right activity on
+/// `activityStarted` without knowing about any concrete game.
 @MainActor
 public final class RoomActivityRegistry {
 
@@ -99,8 +96,8 @@ public final class RoomActivityRegistry {
         factories[kind] != nil
     }
 
-    /// Instancia la actividad descrita, o `nil` si esta build no la conoce (por
-    /// ejemplo, un peer más moderno propone un juego que aquí no existe).
+    /// Instantiates the described activity, or `nil` if this build doesn't
+    /// know it (e.g. a newer peer proposes a game this build lacks).
     public func makeActivity(for context: ActivityContext) -> (any RoomActivity)? {
         factories[context.descriptor.kind]?(context)
     }

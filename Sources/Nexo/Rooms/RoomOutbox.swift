@@ -1,20 +1,17 @@
 //
 //  RoomOutbox.swift
-//  Project Dark
-//
-//  Created by Marcos del Castillo Camacho on 11/09/2026.
+//  Nexo
 //
 
 import Foundation
 
 // MARK: - RoomOutbox
 
-/// Emisor con ámbito de room. Es la única vía por la que el chat, las
-/// actividades y las transferencias envían datos.
+/// Room-scoped sender. The only way chat, activities and transfers send data.
 ///
-/// Sustituye a los canales singleton del stack anterior: cada consumidor recibe
-/// un `RoomOutbox` ligado a *su* room, así que no puede escribir en otra room ni
-/// necesita conocer el transporte.
+/// Replaces singleton channels: every consumer gets a `RoomOutbox` bound to
+/// *its* room, so it can't write into another room and never needs to know
+/// about the transport.
 @MainActor
 public final class RoomOutbox {
 
@@ -22,8 +19,8 @@ public final class RoomOutbox {
 
     private let transport: any PeerTransport
     private let identity: LocalP2PIdentity
-    /// Miembros a los que difundir, excluido el usuario local. Se resuelve en
-    /// cada envío para que la membresía viva no quede capturada.
+    /// Members to broadcast to, excluding the local user. Resolved on every
+    /// send so live membership is never captured stale.
     private let recipients: @MainActor () -> [String]
 
     private var sequence: UInt64 = 0
@@ -34,8 +31,8 @@ public final class RoomOutbox {
         var createdAt: Date
     }
 
-    /// Conserva durante un intervalo corto los mensajes que deben ponerse al
-    /// día después de una pérdida física. El transporte sigue sin conocer rooms.
+    /// Keeps recent messages for a short window so a peer can catch up after
+    /// a physical drop. The transport itself still knows nothing about rooms.
     private var recoveryJournal: [JournalEntry] = []
     private var recoveryJournalBytes = 0
 
@@ -55,11 +52,11 @@ public final class RoomOutbox {
 
     // MARK: - Public API
 
-    /// Envía un mensaje tipado por el canal indicado.
+    /// Sends a typed message on the given channel.
     ///
-    /// Los fallos de codificación se ignoran deliberadamente: un mensaje mal
-    /// formado es un error de programación que no debe tirar la UI, y el
-    /// transporte ya reintenta o notifica la desconexión por su cuenta.
+    /// Encoding failures are ignored deliberately: a malformed message is a
+    /// programming error that shouldn't crash the UI, and the transport
+    /// already retries or reports disconnects on its own.
     public func send<Message: Encodable & Sendable>(
         _ message: Message,
         channel: RoomChannel,
@@ -86,9 +83,8 @@ public final class RoomOutbox {
         }
     }
 
-    /// Reentrega los mensajes recientes dirigidos a un peer que acaba de
-    /// recuperar el socket. Los messageID se conservan para que el receptor
-    /// pueda descartar duplicados de forma idempotente.
+    /// Replays recent messages to a peer that just recovered its socket.
+    /// Message IDs are preserved so the receiver can idempotently drop duplicates.
     public func replay(to applicationID: String) {
         pruneRecoveryJournal()
         for entry in recoveryJournal where entry.recipients.contains(applicationID) {
@@ -96,11 +92,10 @@ public final class RoomOutbox {
         }
     }
 
-    /// Envía estado voluminoso y sustituible, como un snapshot de tablero.
+    /// Sends bulky, replaceable state, like a board snapshot.
     ///
-    /// La `coalescingKey` hace que un snapshot pendiente se reemplace por el
-    /// siguiente en vez de acumularse, de modo que nunca queda por delante de una
-    /// orden autoritativa.
+    /// `coalescingKey` makes a pending snapshot get replaced by the next one
+    /// instead of piling up, so it never sits ahead of an authoritative order.
     public func sendCoalesced<Message: Encodable & Sendable>(
         _ message: Message,
         channel: RoomChannel,
@@ -121,8 +116,8 @@ public final class RoomOutbox {
     // MARK: - Recovery Journal
 
     private func appendToRecoveryJournal(_ envelope: RoomEnvelope, recipients: [String]) {
-        // Las transferencias tienen su propio protocolo de ACK y no deben
-        // reinyectar chunks antiguos; chat y actividades sí son reanudables.
+        // Transfers have their own ACK protocol and must not reinject old
+        // chunks; chat and activities are resumable.
         guard envelope.channel == .chat || envelope.channel == .activity else { return }
         guard envelope.payload.count <= P2PLimits.maximumEnvelopeBytes else { return }
 

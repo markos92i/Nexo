@@ -1,40 +1,37 @@
 //
 //  RoomSession.swift
-//  Project Dark
-//
-//  Created by Marcos del Castillo Camacho on 11/09/2026.
+//  Nexo
 //
 
 import Foundation
 
 // MARK: - RoomSession
 
-/// Room viva: miembros, chat y actividades.
+/// A live room: members, chat and activities.
 ///
-/// Sobrevive a la navegación entre la lista de salas, el chat, el lobby de una
-/// partida, la partida y el resultado. Salir de una actividad destruye la
-/// actividad, no la sesión.
+/// Survives navigation across the room list, chat, a game's lobby, the game
+/// itself and its result. Leaving an activity destroys the activity, not the session.
 @MainActor
 @Observable
 public final class RoomSession: Identifiable {
 
-    // MARK: - Identidad
+    // MARK: - Identity
 
     public let roomID: RoomID
     public private(set) var descriptor: RoomDescriptor
 
-    /// `nonisolated` porque `roomID` es inmutable: leer la identidad de la sesión
-    /// desde fuera del actor principal no puede provocar una carrera.
+    /// `nonisolated` because `roomID` is immutable: reading the session's
+    /// identity off the main actor can't race.
     public nonisolated var id: RoomID { roomID }
 
-    // MARK: - Estado
+    // MARK: - State
 
     public private(set) var members: [RoomMember] = []
     public private(set) var accessState: RoomAccessState
-    /// Solicitudes pendientes de aprobación. Es una cola por room: el host puede
-    /// gobernar varias rooms con colas independientes.
+    /// Pending approval requests. Scoped per room: a host can govern several
+    /// rooms with independent queues.
     public private(set) var pendingJoinRequests: [RoomJoinRequest] = []
-    /// Actividades vivas, indexadas por identificador.
+    /// Live activities, indexed by ID.
     public private(set) var activities: [ActivityID: any RoomActivity] = [:]
 
     public let chat: ChatRoomSession?
@@ -42,7 +39,7 @@ public final class RoomSession: Identifiable {
     private let identity: LocalP2PIdentity
     private let outbox: RoomOutbox
 
-    // MARK: - Derivados
+    // MARK: - Derived
 
     public var isLocalHost: Bool { descriptor.hostApplicationID == identity.applicationID }
     public var localRole: RoomRole { isLocalHost ? .host : .guest }
@@ -53,13 +50,13 @@ public final class RoomSession: Identifiable {
         members.first { $0.applicationID == descriptor.hostApplicationID }
     }
 
-    /// Miembros distintos del usuario local.
+    /// Members other than the local user.
     public var remoteMembers: [RoomMember] {
         members.filter { $0.applicationID != identity.applicationID }
     }
 
-    /// Actividad principal para una UI que solo muestra una partida a la vez.
-    /// Ignora las no exclusivas (p. ej. un chat), que pueden convivir con ella.
+    /// The primary activity for a UI that only shows one game at a time.
+    /// Ignores non-exclusive ones (e.g. chat), which can run alongside it.
     public var primaryActivity: (any RoomActivity)? {
         activities.values.first { $0.descriptor.isActive && $0.descriptor.isExclusive }
             ?? activities.values.first { $0.descriptor.isExclusive }
@@ -85,24 +82,23 @@ public final class RoomSession: Identifiable {
         self.outbox = outbox
         self.accessState = accessState
         self.members = members
-        // El índice se rellena aquí también para que `contains` sea fiable antes
-        // de la primera actualización de membresía.
+        // Indexed here too so `contains` is reliable before the first membership update.
         self.memberCache = Self.index(members)
         self.chat = descriptor.features.hasChat
             ? ChatRoomSession(roomID: descriptor.id, outbox: outbox, identity: identity)
             : nil
     }
 
-    // MARK: - Membresía
+    // MARK: - Membership
 
     public func apply(descriptor: RoomDescriptor) {
         self.descriptor = descriptor
     }
 
     public func apply(members: [RoomMember]) {
-        // La lista llega de un peer remoto y no está autenticada: puede traer
-        // identidades repetidas. Se deduplica antes de indexarla, porque un
-        // `Dictionary(uniqueKeysWithValues:)` con claves repetidas aborta.
+        // This list comes from a remote peer and isn't authenticated: it may
+        // contain duplicate identities. Deduplicate before indexing, since
+        // `Dictionary(uniqueKeysWithValues:)` aborts on repeated keys.
         let sanitized = Self.deduplicate(members)
 
         let previous = Set(self.members.map(\.applicationID))
@@ -139,7 +135,7 @@ public final class RoomSession: Identifiable {
         memberCache[applicationID] != nil
     }
 
-    // MARK: - Solicitudes de entrada
+    // MARK: - Join requests
 
     public func enqueueJoinRequest(_ request: RoomJoinRequest) -> Bool {
         guard !pendingJoinRequests.contains(where: { $0.applicationID == request.applicationID }) else {
@@ -158,7 +154,7 @@ public final class RoomSession: Identifiable {
         pendingJoinRequests.removeAll { $0.applicationID == applicationID }
     }
 
-    // MARK: - Actividades
+    // MARK: - Activities
 
     public func register(_ activity: any RoomActivity) {
         activities[activity.descriptor.id] = activity
@@ -185,8 +181,8 @@ public final class RoomSession: Identifiable {
         }
     }
 
-    /// Elimina únicamente las actividades que ya no aparecen en el snapshot
-    /// autoritativo del host, conservando las demás instancias y su estado.
+    /// Removes only the activities no longer present in the host's
+    /// authoritative snapshot, keeping the rest and their state.
     public func removeActivities(notIncludedIn activeIDs: Set<ActivityID>, reason: String) {
         let staleIDs = activities.keys.filter { !activeIDs.contains($0) }
         for activityID in staleIDs {
@@ -194,7 +190,7 @@ public final class RoomSession: Identifiable {
         }
     }
 
-    /// Contexto para instanciar una actividad con el ámbito de esta room.
+    /// Context to instantiate an activity scoped to this room.
     public func makeActivityContext(for descriptor: ActivityDescriptor) -> ActivityContext {
         ActivityContext(
             descriptor: descriptor,
@@ -218,7 +214,7 @@ public final class RoomSession: Identifiable {
         }
     }
 
-    /// Conserva la primera aparición de cada identidad.
+    /// Keeps the first occurrence of each identity.
     private static func deduplicate(_ members: [RoomMember]) -> [RoomMember] {
         var seen: Set<String> = []
         return members.filter { seen.insert($0.applicationID).inserted }

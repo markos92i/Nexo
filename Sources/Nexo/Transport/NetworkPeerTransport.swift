@@ -1,8 +1,6 @@
 //
 //  NetworkPeerTransport.swift
-//  Project Dark
-//
-//  Created by Marcos del Castillo Camacho on 11/09/2026.
+//  Nexo
 //
 
 import Foundation
@@ -10,24 +8,24 @@ import Network
 
 // MARK: - NetworkPeerTransport
 
-/// Transporte P2P sobre las APIs estructuradas de Network Framework (iOS 26).
+/// P2P transport over Network framework's structured API (iOS 26).
 ///
-/// Pila de protocolos: `Coder<P2PFrame> / TCP / IP` con Bonjour y peer-to-peer
-/// activado.
+/// Protocol stack: `Coder<P2PFrame> / TCP / IP` with Bonjour and
+/// peer-to-peer enabled.
 ///
-/// - Note: **No hay TLS.** El `TLS` del builder nuevo exige un
-///   `sec_identity_t` local (`TLS.localIdentity(_:)`); un listener sin identidad
-///   falla el handshake con `-9810`, comprobado en ejecución. Emitir un
-///   certificado autofirmado forma parte de la capa de identidad, que está fuera
-///   de alcance ahora. Consecuencia: el tráfico viaja **sin cifrar** por la red
-///   local y **no se verifica** la identidad del peer.
+/// - Note: **No TLS.** The new builder's `TLS` requires a local
+///   `sec_identity_t` (`TLS.localIdentity(_:)`); a listener without an
+///   identity fails the handshake with `-9810` (verified at runtime).
+///   Issuing a self-signed certificate belongs to an identity layer that's
+///   out of scope for now. Consequence: traffic travels **unencrypted** on
+///   the local network and peer identity is **not verified**.
 @MainActor
 public final class NetworkPeerTransport: PeerTransport {
 
     // MARK: - Network Types
 
-    // `fileprivate` y no `private`: los tipos aparecen en las firmas de las
-    // extensiones de este mismo fichero.
+    // `fileprivate`, not `private`: these types appear in signatures of
+    // extensions in this same file.
     fileprivate typealias ApplicationProtocol = Coder<P2PFrame, P2PFrame, NetworkJSONCoder>
     fileprivate typealias Parameters = NWParametersBuilder<ApplicationProtocol>
     fileprivate typealias Connection = NetworkConnection<ApplicationProtocol>
@@ -35,21 +33,21 @@ public final class NetworkPeerTransport: PeerTransport {
 
     // MARK: - PeerConnectionBox
 
-    /// Estado de una conexión física concreta.
+    /// State of one physical connection.
     @MainActor
     fileprivate final class PeerConnectionBox {
         let connectionID: TransportPeerID
         let connection: Connection
         let isOutgoing: Bool
-        /// Endpoint Bonjour al que se marcó, solo en salientes.
+        /// Bonjour endpoint dialed, only set for outgoing connections.
         ///
-        /// `connectionID` vive en el espacio de identificadores de Network y no
-        /// se puede comparar con el de un `Bonjour.Endpoint`; guardarlo aparte es
-        /// lo que permite detectar un segundo marcado al mismo endpoint.
+        /// `connectionID` lives in Network's own identifier space and can't be
+        /// compared to a `Bonjour.Endpoint`'s; keeping this separately is what
+        /// lets us detect a second dial to the same endpoint.
         let dialedEndpointID: TransportPeerID?
         let sessionID = UUID()
 
-        /// Se rellena al recibir el `hello` del remoto.
+        /// Filled in once the remote's `hello` arrives.
         var peer: ConnectedPeer?
         var receiveTask: Task<Void, Never>?
         var timeoutTask: Task<Void, Never>?
@@ -70,7 +68,7 @@ public final class NetworkPeerTransport: PeerTransport {
             self.dialedEndpointID = dialedEndpointID
         }
 
-        /// Resuelve y limpia a todos los que esperaban este handshake.
+        /// Resolves and clears everyone waiting on this handshake.
         func resolve(with result: Result<ConnectedPeer, Error>) {
             let waiting = readyContinuations
             readyContinuations.removeAll()
@@ -89,17 +87,17 @@ public final class NetworkPeerTransport: PeerTransport {
         }
     }
 
-    // MARK: - Identidad y anuncio
+    // MARK: - Identity and advertisement
 
     private let applicationID: String
     private var advertisement: AdvertisementRecord
 
-    /// Nombre de servicio Bonjour. Se deriva del `applicationID` y no del nombre
-    /// visible, de modo que renombrar el dispositivo solo cambia el registro TXT
-    /// y no obliga a reiniciar el listener ni corta las conexiones abiertas.
+    /// Bonjour service name. Derived from `applicationID`, not the display
+    /// name, so renaming the device only changes the TXT record without
+    /// restarting the listener or dropping open connections.
     private var serviceName: String { String(applicationID.prefix(8)).lowercased() }
 
-    // MARK: - Ciclo de vida
+    // MARK: - Lifecycle
 
     public private(set) var epoch: UInt64 = 0
     private var isAdvertising = false
@@ -108,23 +106,23 @@ public final class NetworkPeerTransport: PeerTransport {
     private var listenerTask: Task<Void, Never>?
     private var browserTask: Task<Void, Never>?
 
-    // MARK: - Eventos
+    // MARK: - Events
 
     private let eventStream: AsyncStream<PeerTransportEvent>
     private let eventContinuation: AsyncStream<PeerTransportEvent>.Continuation
 
     public var events: AsyncStream<PeerTransportEvent> { eventStream }
 
-    // MARK: - Descubrimiento
+    // MARK: - Discovery
 
     private var advertisements: [TransportPeerID: PeerAdvertisement] = [:]
     private var endpoints: [TransportPeerID: Bonjour.Endpoint] = [:]
 
-    // MARK: - Conexiones
+    // MARK: - Connections
 
-    /// Conexiones vivas indexadas por el identificador de Network.
+    /// Live connections indexed by Network's identifier.
     private var boxes: [TransportPeerID: PeerConnectionBox] = [:]
-    /// Conexión ganadora por peer, ya con handshake hecho.
+    /// Winning connection per peer, once handshaken.
     private var connectionIDsByApplicationID: [String: TransportPeerID] = [:]
 
     public var connectedPeers: [ConnectedPeer] {
@@ -151,7 +149,7 @@ public final class NetworkPeerTransport: PeerTransport {
         eventContinuation.finish()
     }
 
-    // MARK: - Ciclo de vida
+    // MARK: - Lifecycle
 
     public func start(advertising: Bool, browsing: Bool) {
         let advertisingChanged = isAdvertising != advertising
@@ -188,8 +186,8 @@ public final class NetworkPeerTransport: PeerTransport {
         browserTask?.cancel()
         browserTask = nil
 
-        // Los peers establecidos deben notificarse: si no, el dominio sigue
-        // creyéndolos conectados y al volver de background nunca se remarca.
+        // Established peers must be notified: otherwise the domain keeps
+        // thinking they're connected and never re-marks them after background.
         let establishedPeers = boxes.values.compactMap(\.peer)
 
         for box in boxes.values {
@@ -199,9 +197,9 @@ public final class NetworkPeerTransport: PeerTransport {
         boxes.removeAll()
         connectionIDsByApplicationID.removeAll()
 
-        // Estos eventos pertenecen a la época que se está cerrando. El manager
-        // los descarta al ver que ya no coinciden con la época activa, evitando
-        // tratar una suspensión voluntaria como una desconexión real de la room.
+        // These events belong to the epoch being closed. The manager discards
+        // them once they no longer match the active epoch, so a voluntary
+        // suspension is never treated as a real room disconnect.
         for peer in establishedPeers {
             emit(.peerDisconnected(
                 applicationID: peer.applicationID,
@@ -225,22 +223,22 @@ public final class NetworkPeerTransport: PeerTransport {
 
         guard isAdvertising, let listener else { return }
 
-        // El registro TXT se puede sustituir en caliente: el browser remoto ve el
-        // cambio sin que se reinicie el servicio ni se caigan las conexiones.
+        // The TXT record can be swapped live: the remote browser sees the
+        // change without the service restarting or connections dropping.
         var service = listener.service
         service?.txtRecordObject = NWTXTRecord(record.txtDictionary)
         listener.service = service
 
-        // El nombre visible viaja en TXT, así que un renombrado tampoco fuerza
-        // recrear el listener.
+        // The display name travels in TXT, so a rename doesn't force
+        // recreating the listener either.
     }
 
-    // MARK: - Conexiones
+    // MARK: - Connections
 
     @discardableResult
     public func connect(to advertisement: PeerAdvertisement) async throws -> ConnectedPeer {
-        // Reutiliza la conexión física existente: entrar en una segunda room con
-        // el mismo peer no debe abrir otro socket.
+        // Reuses the existing physical connection: joining a second room with
+        // the same peer must not open another socket.
         if let applicationID = advertisement.applicationID,
            let existingID = connectionIDsByApplicationID[applicationID],
            let peer = boxes[existingID]?.peer {
@@ -255,9 +253,9 @@ public final class NetworkPeerTransport: PeerTransport {
             throw P2PTransportError.peerNotDiscovered
         }
 
-        // Si ya hay un marcado en curso al mismo endpoint, se espera a ese en vez
-        // de abrir un segundo socket. Sin esta comprobación aparecen varias
-        // conexiones en la misma dirección y el desempate deja de ser simétrico.
+        // If a dial to the same endpoint is already in flight, wait on it
+        // instead of opening a second socket. Without this check several
+        // connections appear in the same direction and tie-breaking stops being symmetric.
         if let pending = boxes.values.first(where: {
             $0.isOutgoing && $0.dialedEndpointID == advertisement.endpointID && !$0.isHandshakeComplete
         }) {
@@ -296,7 +294,7 @@ public final class NetworkPeerTransport: PeerTransport {
         )
     }
 
-    // MARK: - Envío
+    // MARK: - Sending
 
     public func enqueue(_ envelope: RoomEnvelope, to applicationID: String) {
         guard let connectionID = connectionIDsByApplicationID[applicationID],
@@ -307,7 +305,7 @@ public final class NetworkPeerTransport: PeerTransport {
     }
 }
 
-// MARK: - Pila Network
+// MARK: - Network stack
 
 @MainActor
 private extension NetworkPeerTransport {
@@ -370,8 +368,8 @@ private extension NetworkPeerTransport {
         browserTask = Task { @MainActor [weak self] in
             guard let self else { return }
 
-            // `includeTxtRecord: true` es obligatorio: sin él el registro TXT
-            // llega vacío y no se pueden listar rooms antes de conectar.
+            // `includeTxtRecord: true` is mandatory: without it the TXT
+            // record arrives empty and rooms can't be listed before connecting.
             let browser = NetworkBrowser(
                 for: .bonjour(
                     P2PProtocolInfo.serviceType,
@@ -405,15 +403,15 @@ private extension NetworkPeerTransport {
                 fallbackName: endpoint.name.isEmpty ? endpoint.id : endpoint.name
             )
 
-            // El propio anuncio se ve en el browser: hay que filtrarlo.
+            // The advertisement shows up in our own browser: must be filtered out.
             guard record.applicationID != applicationID else { continue }
 
             seen.insert(endpointID)
             endpoints[endpointID] = endpoint
 
-            // Una instalación solo puede estar en un endpoint. Si reaparece con
-            // otro identificador (renombrado, cambio de interfaz), el anterior
-            // queda obsoleto y hay que retirarlo o `connect` marcaría al viejo.
+            // One installation can only be at one endpoint. If it reappears
+            // with a different identifier (renamed, interface change), the
+            // old one is stale and must be retired, or `connect` would dial it.
             if let applicationID = record.applicationID {
                 for (staleID, stale) in advertisements
                 where staleID != endpointID && stale.applicationID == applicationID {
@@ -451,7 +449,7 @@ private extension NetworkPeerTransport {
     }
 }
 
-// MARK: - Handshake y recepción
+// MARK: - Handshake and receiving
 
 @MainActor
 private extension NetworkPeerTransport {
@@ -460,8 +458,8 @@ private extension NetworkPeerTransport {
         let box = register(connection: connection, isOutgoing: false)
         sendHello(on: box)
 
-        // La conexión entrante vive mientras dure su bucle de recepción; el
-        // closure de `listener.run` no debe volver antes.
+        // The incoming connection lives as long as its receive loop runs;
+        // `listener.run`'s closure must not return before that.
         if let receiveTask = box.receiveTask {
             await receiveTask.value
         }
@@ -532,7 +530,7 @@ private extension NetworkPeerTransport {
             for try await message in box.connection.messages {
                 handle(message.content, on: box)
             }
-            // Fin limpio del stream: el peer soltó la conexión.
+            // Clean end of stream: the peer dropped the connection.
             fail(
                 box,
                 error: P2PTransportError.connectionFailed("El otro dispositivo cerró la conexión."),
@@ -566,7 +564,7 @@ private extension NetworkPeerTransport {
                 return
             }
 
-            // Un peer no puede firmar un envelope en nombre de otro.
+            // A peer can't sign an envelope on another's behalf.
             guard envelope.senderApplicationID == peer.applicationID else { return }
 
             guard envelope.payload.count <= P2PLimits.maximumEnvelopeBytes else { return }
@@ -597,9 +595,9 @@ private extension NetworkPeerTransport {
             return
         }
 
-        // Ambos dispositivos anuncian y buscan a la vez, así que pueden abrir dos
-        // conexiones simultáneas. La regla de desempate es determinista y ambos
-        // extremos llegan a la misma conclusión, por lo que descartan la misma.
+        // Both devices advertise and browse at once, so they can open two
+        // simultaneous connections. The tie-break rule is deterministic and
+        // both ends reach the same conclusion, so they discard the same one.
         if let rivalID = connectionIDsByApplicationID[body.applicationID],
            let rival = boxes[rivalID], rival !== box {
             let keepOutgoing = min(applicationID, body.applicationID) == applicationID
@@ -632,8 +630,8 @@ private extension NetworkPeerTransport {
         emit(.peerConnected(peer, epoch: epoch))
     }
 
-    /// Cierra la conexión perdedora de un empate sin emitir `peerDisconnected`:
-    /// el peer sigue conectado por la otra conexión.
+    /// Closes the loser of a tie without emitting `peerDisconnected`: the
+    /// peer is still connected through the other connection.
     func discardDuplicate(_ box: PeerConnectionBox) {
         box.resolve(with: .failure(P2PTransportError.connectionFailed("Conexión duplicada.")))
 
@@ -646,8 +644,9 @@ private extension NetworkPeerTransport {
         boxes.removeValue(forKey: box.connectionID)
     }
 
-    /// Única ruta de teardown. Suelta la conexión (Network no ofrece `cancel()`
-    /// en iOS 26) y notifica al dominio solo si el peer estaba establecido.
+    /// The single teardown path. Drops the connection (Network offers no
+    /// `cancel()` on iOS 26) and notifies the domain only if the peer had
+    /// been established.
     func fail(_ box: PeerConnectionBox, error: Error, notifyPeer: Bool) {
         guard boxes[box.connectionID] != nil else { return }
 
@@ -665,7 +664,7 @@ private extension NetworkPeerTransport {
 
         guard let peer = box.peer else { return }
 
-        // Solo se limpia el índice si esta era la conexión vigente del peer.
+        // Only clean up the index if this was the peer's current connection.
         if connectionIDsByApplicationID[peer.applicationID] == box.connectionID {
             connectionIDsByApplicationID.removeValue(forKey: peer.applicationID)
             emit(.peerDisconnected(

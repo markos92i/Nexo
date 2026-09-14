@@ -7,19 +7,17 @@ import Foundation
 
 // MARK: - GenericActivity
 
-/// Adaptador base reutilizable entre `RoomActivity` y un enum de mensajes
-/// tipado. Decodifica el payload, guarda los mensajes llegados antes de que la
-/// UI esté lista y expone puntos de extensión por closure en vez de un
-/// protocolo delegate propio por juego.
+/// Reusable adapter between `RoomActivity` and a typed message enum. Handles
+/// decoding, buffering messages that arrive before the UI attaches, and
+/// coalesced sending, so a concrete activity is just the message type plus
+/// wiring its closures.
 @MainActor
 @Observable
 open class GenericActivity<Message: Codable & Sendable>: RoomActivity {
 
     public private(set) var descriptor: ActivityDescriptor
 
-    /// Se conecta cuando la UI de la partida está viva. Mientras no lo esté, los
-    /// mensajes se guardan: un mensaje autoritativo puede llegar antes de que la
-    /// vista aparezca y no debe perderse.
+    /// `nil` until the UI attaches; incoming messages are buffered until then.
     public var onReceive: ((Message, RoomMember) -> Void)? {
         didSet { flushPendingMessages() }
     }
@@ -41,7 +39,7 @@ open class GenericActivity<Message: Codable & Sendable>: RoomActivity {
         self.descriptor = context.descriptor
     }
 
-    /// Difunde un mensaje tipado a los participantes indicados, o a todos si se omite.
+    /// Broadcasts a typed message to the given recipient, or to all participants.
     public func send(_ message: Message, coalescingKey: String? = nil, to member: RoomMember? = nil) {
         let recipients = member.map { [$0.applicationID] } ?? participants.map(\.applicationID)
         guard !recipients.isEmpty else { return }
@@ -64,7 +62,7 @@ open class GenericActivity<Message: Codable & Sendable>: RoomActivity {
         }
     }
 
-    /// Actualiza el estado de la actividad. Solo tiene efecto en el host.
+    /// Updates activity state. Only takes effect when called by the host.
     public func setState(_ state: ActivityState) {
         guard isLocalHost, descriptor.state != state else { return }
         descriptor.state = state

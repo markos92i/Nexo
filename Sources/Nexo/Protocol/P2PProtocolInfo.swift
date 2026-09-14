@@ -1,28 +1,23 @@
 //
 //  P2PProtocolInfo.swift
-//  Project Dark
-//
-//  Created by Marcos del Castillo Camacho on 11/09/2026.
+//  Nexo
 //
 
 import Foundation
 
 // MARK: - P2PProtocolInfo
 
-/// Versión y capacidades del protocolo de aplicación que viaja sobre Network
-/// Framework. El handshake negocia estos valores antes de admitir envelopes.
+/// Version and capabilities of the application protocol carried over Network
+/// framework. Negotiated during the handshake, before any envelope is admitted.
 public enum P2PProtocolInfo {
 
-    /// Versión actual del protocolo. El resume de rooms forma parte del wire
-    /// de esta versión, así que no se anuncia como compatible a peers v2.
+    /// Room resume is part of this version's wire format, so it is not
+    /// advertised as compatible with older peers.
     public static let currentVersion: UInt8 = 3
-
-    /// Esta build necesita la versión que conoce `roomResume`.
     public static let minimumVersion: UInt8 = 3
 
-    /// Capacidades anunciadas en el `hello`. Permiten activar funciones nuevas
-    /// sin romper a un peer más antiguo: si la capacidad no está en la lista del
-    /// remoto, no se usa con ese peer.
+    /// Capabilities advertised in `hello`. Lets new features roll out without
+    /// breaking older peers: unsupported capabilities are simply not used with them.
     public static let capabilities: Set<P2PCapability> = [
         .rooms,
         .chat,
@@ -31,8 +26,7 @@ public enum P2PProtocolInfo {
         .coalescedSnapshots
     ]
 
-    /// Nombre del servicio Bonjour. Debe coincidir con `NSBonjourServices` en
-    /// `Project-Dark-Info.plist`.
+    /// Must match `NSBonjourServices` in the app's Info.plist.
     public static let serviceType = "_zafir-nearby._tcp"
 
     public static func isCompatible(remoteVersion: UInt8) -> Bool {
@@ -43,46 +37,33 @@ public enum P2PProtocolInfo {
 // MARK: - P2PCapability
 
 public enum P2PCapability: String, Codable, Sendable, CaseIterable {
-    /// Soporta rooms lógicas multiplexadas sobre una conexión física.
     case rooms
-    /// Soporta el canal de chat.
     case chat
-    /// Soporta actividades (juegos) dentro de una room.
     case activities
-    /// Soporta transferencia de ficheros por chunks.
     case fileTransfer
-    /// Soporta snapshots con política latest-wins en la cola de envío.
     case coalescedSnapshots
 }
 
 // MARK: - P2PLimits
 
-/// Límites técnicos. El producto no impone un máximo de participantes, pero el
-/// host sí debe protegerse de memoria, ancho de banda y mensajes abusivos.
+/// Technical limits. There's no hard cap on participants, but the host still
+/// needs protecting from memory pressure, bandwidth, and abusive messages.
 public enum P2PLimits {
 
-    /// Tamaño máximo de un envelope decodificado.
     public static let maximumEnvelopeBytes = 512 * 1024
-
-    /// Tamaño máximo de un fichero ofertado.
     public static let maximumTransferBytes: Int64 = 25 * 1024 * 1024
-
-    /// Tamaño de cada chunk de transferencia.
     public static let transferChunkBytes = 32 * 1024
-
-    /// Chunks en vuelo antes de esperar confirmación del receptor (backpressure).
+    /// In-flight chunks before waiting on receiver backpressure.
     public static let transferWindowChunks = 8
-
-    /// Mensajes de chat retenidos en memoria por room.
     public static let chatHistoryLimit = 500
 
-    /// Tiempo durante el que una pérdida física se considera recuperable.
-    /// La fecha límite se comprueba también al volver de background, porque iOS
-    /// puede suspender la ejecución y no garantiza que un timer avance.
+    /// How long a physical disconnect is still considered recoverable. Also
+    /// checked on foreground return, since iOS may suspend execution without
+    /// guaranteeing a timer advances.
     public static let temporaryDisconnectGracePeriod: TimeInterval = 60
 
-    /// Retención del journal de chat/actividad usado para reentregar mensajes
-    /// después de una reconexión física.
+    /// Retention window for the chat/activity journal used to replay messages
+    /// after a physical reconnection.
     public static let recoveryJournalRetention: TimeInterval = 60
     public static let recoveryJournalLimit = 2_000
     public static let recoveryJournalBytesLimit = 4 * 1024 * 1024
@@ -90,13 +71,10 @@ public enum P2PLimits {
     public static let recoveryMemberLimit = 256
     public static let recoveryActivityLimit = 64
 
-    /// Rooms anunciadas en el registro TXT de Bonjour. El resto se conoce al
-    /// conectar mediante `roomDirectory`.
+    /// Rooms advertised in the Bonjour TXT record. The rest are discovered on
+    /// connect via `roomDirectory`.
     public static let advertisedRoomLimit = 3
 
-    /// Tiempo máximo de espera del handshake físico.
     public static let handshakeTimeout: Duration = .seconds(12)
-
-    /// Tiempo máximo de espera de una respuesta de entrada a room.
     public static let joinTimeout: Duration = .seconds(30)
 }

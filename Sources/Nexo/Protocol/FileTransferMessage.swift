@@ -1,26 +1,23 @@
 //
 //  FileTransferMessage.swift
-//  Project Dark
-//
-//  Created by Marcos del Castillo Camacho on 11/09/2026.
+//  Nexo
 //
 
 import Foundation
 
 // MARK: - FileTransferMessage
 
-/// Mensajes del canal `.fileTransfer`.
+/// Messages on the `.fileTransfer` channel.
 ///
-/// El contenido nunca viaja dentro de un `ChatMessage`: el chat solo transporta
-/// los metadatos y el identificador de la transferencia, y el fichero llega por
-/// esta secuencia de chunks.
+/// Content never travels inside a `ChatMessage`: chat only carries metadata
+/// and the transfer ID, and the file itself arrives through this chunk sequence.
 public enum FileTransferMessage: Codable, Sendable {
     case offer(FileOffer)
     case accept(FileTransferControl)
     case reject(FileTransferRejection)
     case cancel(FileTransferRejection)
-    /// Confirmación del receptor cada `transferWindowChunks` chunks. Es el
-    /// mecanismo de backpressure: el emisor no adelanta la ventana sin ella.
+    /// Receiver acknowledgement every `transferWindowChunks` chunks. This is
+    /// the backpressure mechanism: the sender won't advance the window without it.
     case acknowledge(FileTransferAcknowledgement)
     case chunk(FileChunk)
     case completed(FileTransferControl)
@@ -30,13 +27,13 @@ public enum FileTransferMessage: Codable, Sendable {
 
 public struct FileOffer: Codable, Sendable, Identifiable, Hashable {
     public let transferID: UUID
-    /// Mensaje de chat al que se asocia la transferencia, si viene del chat.
+    /// Chat message this transfer is attached to, if it came from chat.
     public let messageID: UUID?
     public let roomID: RoomID
     public let fileName: String
     public let mimeType: String
     public let fileSize: Int64
-    /// SHA-256 en hexadecimal del contenido completo.
+    /// Hex SHA-256 of the full content.
     public let checksum: String
     public let chunkCount: Int
     public let chunkSize: Int
@@ -70,7 +67,7 @@ public struct FileTransferRejection: Codable, Sendable {
 public struct FileTransferAcknowledgement: Codable, Sendable {
     public let transferID: UUID
     public let roomID: RoomID
-    /// Índice del último chunk escrito en disco por el receptor.
+    /// Index of the last chunk the receiver wrote to disk.
     public let receivedThroughIndex: Int
 }
 

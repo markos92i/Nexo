@@ -1,6 +1,6 @@
 //
 //  P2PNotice.swift
-//  Project Dark
+//  Nexo
 //
 //  Domain notices emitted by the P2P layer for app-wide UI surfaces.
 //

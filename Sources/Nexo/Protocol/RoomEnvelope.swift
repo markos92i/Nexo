@@ -1,45 +1,40 @@
 //
 //  RoomEnvelope.swift
-//  Project Dark
-//
-//  Created by Marcos del Castillo Camacho on 11/09/2026.
+//  Nexo
 //
 
 import Foundation
 
 // MARK: - RoomChannel
 
-/// Canal lógico multiplexado sobre la conexión física.
+/// Logical channel multiplexed over the physical connection.
 public enum RoomChannel: String, Codable, Sendable {
-    /// Membresía, directorio y ciclo de vida de rooms y actividades.
     case control
-    /// Mensajería de texto.
     case chat
-    /// Payload opaco de una actividad. El envelope lleva `activityID`.
+    /// Opaque activity payload. The envelope also carries `activityID`.
     case activity
-    /// Oferta, chunks y control de transferencias de ficheros.
     case fileTransfer
 }
 
 // MARK: - DeliveryMode
 
-/// Prioridad y política de descarte del envelope.
+/// Priority and drop policy for an envelope.
 public enum DeliveryMode: String, Codable, Sendable {
-    /// Se entrega en orden y nunca se descarta.
+    /// Delivered in order, never dropped.
     case reliable
-    /// Se puede descartar si queda obsoleto antes de salir de la cola.
+    /// May be dropped if superseded before leaving the queue.
     ///
-    /// Network Framework sobre TCP entrega todo de forma fiable, así que el modo
-    /// no relaja la garantía del socket: lo que hace es habilitar el
-    /// *coalescing* latest-wins en `TransportSendQueue`, de modo que un snapshot
-    /// viejo nunca ocupe sitio delante de una orden autoritativa.
+    /// Network framework over TCP still delivers everything reliably, so this
+    /// doesn't relax the socket's guarantee — it enables latest-wins
+    /// coalescing in `TransportSendQueue`, so a stale snapshot never sits in
+    /// front of an authoritative order.
     case unreliable
 }
 
 // MARK: - RoomEnvelope
 
-/// Unidad de transporte de la capa de aplicación. Todo mensaje de room, chat,
-/// actividad o transferencia viaja dentro de un envelope.
+/// Application-layer transport unit. Every room, chat, activity or transfer
+/// message travels inside one of these.
 public struct RoomEnvelope: Codable, Sendable, Identifiable {
     public let protocolVersion: UInt8
     public let roomID: RoomID
@@ -47,12 +42,11 @@ public struct RoomEnvelope: Codable, Sendable, Identifiable {
     public let channel: RoomChannel
     public let messageID: UUID
     public let senderApplicationID: String
-    /// Secuencia por emisor y canal. Permite descartar duplicados y detectar
-    /// mensajes fuera de orden en el futuro.
+    /// Per-sender, per-channel sequence. Enables duplicate/out-of-order detection.
     public let sequence: UInt64?
     public let deliveryMode: DeliveryMode
-    /// Clave de coalescing para envelopes `.unreliable`. Dos envelopes con la
-    /// misma clave son intercambiables: el nuevo sustituye al viejo en la cola.
+    /// Coalescing key for `.unreliable` envelopes. Two envelopes sharing a key
+    /// are interchangeable: the newest replaces the oldest in the queue.
     public let coalescingKey: String?
     public let payload: Data
 
@@ -82,7 +76,7 @@ public struct RoomEnvelope: Codable, Sendable, Identifiable {
         self.payload = payload
     }
 
-    /// Construye un envelope codificando el mensaje tipado del canal.
+    /// Builds an envelope by encoding the channel's typed message.
     public init<Message: Encodable & Sendable>(
         roomID: RoomID,
         activityID: ActivityID? = nil,
@@ -105,13 +99,13 @@ public struct RoomEnvelope: Codable, Sendable, Identifiable {
         )
     }
 
-    /// Decodifica el payload como el tipo esperado por el canal.
+    /// Decodes the payload as the type expected by the channel.
     public func decodePayload<Message: Decodable>(as type: Message.Type) throws -> Message {
         try P2PCoder.decode(type, from: payload)
     }
 
-    /// Identidad de la lane en la que debe encolarse el envelope. Control y
-    /// órdenes de juego no deben quedar detrás de una transferencia grande.
+    /// Lane this envelope should be queued on. Control and game orders must
+    /// never sit behind a large transfer.
     public var lane: TransportLane {
         switch channel {
         case .control: .control
@@ -124,15 +118,15 @@ public struct RoomEnvelope: Codable, Sendable, Identifiable {
 
 // MARK: - TransportLane
 
-/// Lanes lógicas dentro de una misma conexión física, en orden de prioridad.
+/// Logical lanes within one physical connection, in priority order.
 public enum TransportLane: Int, Comparable, Sendable, CaseIterable {
-    /// Membresía y ciclo de vida. Siempre primero.
+    /// Membership and lifecycle. Always first.
     case control = 0
-    /// Chat y órdenes autoritativas de juego.
+    /// Chat and authoritative game orders.
     case interactive = 1
-    /// Estado voluminoso y repetitivo, como los snapshots de tablero.
+    /// Bulky, repetitive state, like board snapshots.
     case bulkState = 2
-    /// Chunks de ficheros. Nunca debe bloquear a las demás.
+    /// File chunks. Must never block the others.
     case transfer = 3
 
     public static func < (lhs: TransportLane, rhs: TransportLane) -> Bool {
@@ -142,11 +136,9 @@ public enum TransportLane: Int, Comparable, Sendable, CaseIterable {
 
 // MARK: - P2PCoder
 
-/// Codificadores compartidos. Reutilizarlos evita crear un `JSONEncoder` por
-/// mensaje, que era el coste dominante al enviar snapshots a 1 Hz por peer.
+/// Shared coders. Reusing them avoids allocating a `JSONEncoder` per message,
+/// which was the dominant cost when broadcasting snapshots to several peers.
 public enum P2PCoder {
-    // Compartir una instancia evita la asignación de un coder por mensaje, que
-    // era el coste dominante al difundir snapshots a varios peers.
     private static let encoder = JSONEncoder()
     private static let decoder = JSONDecoder()
 
