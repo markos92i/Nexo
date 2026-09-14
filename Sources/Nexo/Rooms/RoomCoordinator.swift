@@ -471,7 +471,7 @@ public final class RoomCoordinator {
 @MainActor
 public extension RoomCoordinator {
 
-    public func handleAdvertisement(_ advertisement: PeerAdvertisement) {
+    func handleAdvertisement(_ advertisement: PeerAdvertisement) {
         advertisements[advertisement.endpointID] = advertisement
 
         guard advertisement.isCompatible else { return }
@@ -507,14 +507,14 @@ public extension RoomCoordinator {
         reconnectMissingMembers()
     }
 
-    public func handleAdvertisementLost(_ endpointID: TransportPeerID) {
+    func handleAdvertisementLost(_ endpointID: TransportPeerID) {
         advertisements.removeValue(forKey: endpointID)
         for (roomID, room) in discoveredRooms where room.advertisedBy == endpointID {
             discoveredRooms.removeValue(forKey: roomID)
         }
     }
 
-    public func handlePeerConnected(_ peer: ConnectedPeer) {
+    func handlePeerConnected(_ peer: ConnectedPeer) {
         let wasRecovering = recoveryDeadlines.removeValue(forKey: peer.applicationID) != nil
         recoveryTasks.removeValue(forKey: peer.applicationID)?.cancel()
 
@@ -580,7 +580,7 @@ public extension RoomCoordinator {
         }
     }
 
-    public func requestRoomDirectory(from peer: ConnectedPeer) {
+    func requestRoomDirectory(from peer: ConnectedPeer) {
         guard peer.supports(.rooms) else { return }
         send(
             .roomDirectoryRequest,
@@ -589,7 +589,7 @@ public extension RoomCoordinator {
         )
     }
 
-    public func handlePeerDisconnected(applicationID: String, reason: String?) {
+    func handlePeerDisconnected(applicationID: String, reason: String?) {
         connectedPeers.removeValue(forKey: applicationID)
         var isMemberOfAnyRoom = false
 
@@ -611,7 +611,7 @@ public extension RoomCoordinator {
         }
     }
 
-    public func handleLifecycle(_ lifecycle: ConnectivityLifecycle) {
+    func handleLifecycle(_ lifecycle: ConnectivityLifecycle) {
         switch lifecycle {
         case .suspended:
             // El transporte se cerrará, pero la presencia lógica no cambia. Al
@@ -646,7 +646,7 @@ public extension RoomCoordinator {
 
     /// Punto de entrada de todo envelope recibido. El orden de validación es
     /// conexión física, room, membresía, canal y por último payload tipado.
-    public func route(_ envelope: RoomEnvelope, from peer: ConnectedPeer) {
+    func route(_ envelope: RoomEnvelope, from peer: ConnectedPeer) {
         connectedPeers[peer.applicationID] = peer
 
         if envelope.channel == .control {
