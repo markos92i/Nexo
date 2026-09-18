@@ -104,7 +104,15 @@ public final class NetworkPeerTransport: PeerTransport {
     public private(set) var epoch: UInt64 = 0
     private var isAdvertising = false
     private var isBrowsing = false
-    private var localNetworkPermissionState: LocalNetworkPermissionState = .unknown
+    private var _localNetworkPermissionState: LocalNetworkPermissionState = .unknown
+    
+    /// Estado actual del permiso de red local.
+    ///
+    /// El estado se actualiza automáticamente cuando el transporte detecta
+    /// errores de permisos al intentar escuchar o buscar peers.
+    public var localNetworkPermissionState: LocalNetworkPermissionState {
+        _localNetworkPermissionState
+    }
     private var listener: Listener?
     private var listenerTask: Task<Void, Never>?
     private var quicListener: QUICListener?
@@ -599,8 +607,8 @@ private extension NetworkPeerTransport {
     }
 
     func updateLocalNetworkPermission(_ state: LocalNetworkPermissionState) {
-        guard localNetworkPermissionState != state else { return }
-        localNetworkPermissionState = state
+        guard _localNetworkPermissionState != state else { return }
+        _localNetworkPermissionState = state
         emit(.localNetworkPermissionChanged(state, epoch: epoch))
     }
 

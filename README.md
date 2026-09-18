@@ -59,6 +59,52 @@ No change to the transport, the envelope format, or `RoomCoordinator` is ever re
 - `NetworkPeerTransport` encrypts traffic when supplied with `NexoTLSConfiguration`; the Zafir app creates that configuration automatically for every device.
 - Bonjour TXT records are capped at 255 bytes per entry — anything published there is budgeted in UTF-8 bytes.
 
+## Documentation
+
+- **[USAGE.md](USAGE.md)** — Complete usage guide with examples for permissions, TLS, verification, rooms, chat, file transfer, and activities.
+- **[Security](Sources/Nexo/Documentation.docc/Security.md)** — TOFU encryption model, identity verification, and security best practices.
+- **[Communication Architecture](Sources/Nexo/Documentation.docc/CommunicationArchitecture.md)** — Hybrid TCP/JSON + QUIC/binary transport design.
+
+## Permissions
+
+Before using Nexo, check that Local Network permission is granted:
+
+```swift
+let checker = NexoPermissionsChecker()
+await checker.checkPermissions()
+
+if checker.status.hasCriticalDenial {
+    let guidance = checker.settingsGuidance
+    // Show guidance.title, guidance.message, guidance.steps
+}
+```
+
+## Peer Verification (TOFU)
+
+Nexo uses Trust On First Use, similar to SSH:
+
+```swift
+let verificationService = NexoPeerVerificationService(applicationID: myID)
+
+// Check peer state
+let state = verificationService.verify(connectedPeer)
+
+switch state {
+case .unknown:
+    // First connection - show acceptance UI
+case .trustedOnFirstUse:
+    // Known peer, encrypted connection
+case .verified:
+    // Peer verified out-of-band
+case .identityChanged:
+    // ⚠️ Fingerprint changed - possible MITM
+}
+
+// Visual fingerprint for verification
+let info = verificationService.identityInfo(for: peer)
+print(info.emojiFingerprint)  // "🍎🐶🌸⭐🍇🦊🌻🌙"
+```
+
 ## Local P2P identity
 
 The normal app flow requires no backend or certificate bundle. `NexoLocalTLSIdentity.loadOrCreate(applicationID:)` generates a P-256 key in Keychain, creates a self-signed X.509 certificate locally, and exposes the resulting `sec_identity_t` through `makeTLSConfiguration()`. The private key never leaves the device.
