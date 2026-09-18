@@ -55,11 +55,13 @@ public struct HelloBody: Codable, Sendable {
     public let minimumProtocolVersion: UInt8
     public let applicationID: String
     public let displayName: String
+    public let certificateFingerprint: String?
     public let capabilities: [P2PCapability]
 
     public init(
         applicationID: String,
         displayName: String,
+        certificateFingerprint: String? = nil,
         protocolVersion: UInt8 = P2PProtocolInfo.currentVersion,
         minimumProtocolVersion: UInt8 = P2PProtocolInfo.minimumVersion,
         capabilities: Set<P2PCapability> = P2PProtocolInfo.capabilities
@@ -68,6 +70,7 @@ public struct HelloBody: Codable, Sendable {
         self.minimumProtocolVersion = minimumProtocolVersion
         self.applicationID = applicationID
         self.displayName = displayName
+        self.certificateFingerprint = certificateFingerprint
         self.capabilities = Array(capabilities)
     }
 }

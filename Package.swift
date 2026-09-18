@@ -12,12 +12,24 @@ let package = Package(
             name: "Nexo",
             targets: ["Nexo"]),
     ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-certificates.git", exact: "1.20.0"),
+    ],
     targets: [
         .target(
-            name: "Nexo"),
+            name: "Nexo",
+            dependencies: [
+                .product(name: "X509", package: "swift-certificates"),
+            ]),
         .testTarget(
             name: "NexoTests",
-            dependencies: ["Nexo"]
+            dependencies: ["Nexo"],
+            exclude: [
+                "Fixtures/NexoTestIdentity.pem"
+            ],
+            resources: [
+                .copy("Fixtures/NexoTestIdentity.p12")
+            ]
         ),
     ]
 )

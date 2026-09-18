@@ -49,6 +49,9 @@ public struct PeerAdvertisement: Identifiable, Sendable, Equatable {
 public struct ConnectedPeer: Identifiable, Sendable, Hashable {
     public let applicationID: String
     public let displayName: String
+    /// SHA-256 fingerprint of the peer's certificate public key, exchanged
+    /// over the already encrypted control channel.
+    public let certificateFingerprint: String?
     public let protocolVersion: UInt8
     public let capabilities: Set<P2PCapability>
     /// Concrete connection instance. Changes on every reconnect; used to
@@ -74,6 +77,14 @@ public enum ConnectivityLifecycle: String, Sendable, Equatable {
     case disconnected
 }
 
+// MARK: - LocalNetworkPermissionState
+
+public enum LocalNetworkPermissionState: Sendable, Equatable {
+    case unknown
+    case available
+    case denied
+}
+
 // MARK: - PeerTransportEvent
 
 /// Physical transport events.
@@ -89,6 +100,7 @@ public enum PeerTransportEvent: Sendable {
     case peerDisconnected(applicationID: String, reason: String?, epoch: UInt64)
     case received(RoomEnvelope, from: ConnectedPeer, epoch: UInt64)
     case lifecycleChanged(ConnectivityLifecycle, epoch: UInt64)
+    case localNetworkPermissionChanged(LocalNetworkPermissionState, epoch: UInt64)
 }
 
 // MARK: - P2PTransportError

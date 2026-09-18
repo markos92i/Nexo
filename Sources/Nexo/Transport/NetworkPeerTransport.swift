@@ -5,22 +5,19 @@
 
 import Foundation
 import Network
+import OSLog
 
 // MARK: - NetworkPeerTransport
 
 /// P2P transport over Network framework's structured API (iOS 26).
 ///
-/// Protocol stack: `Coder<P2PFrame> / TCP / IP` with Bonjour and
-/// peer-to-peer enabled.
-///
-/// - Note: **No TLS.** The new builder's `TLS` requires a local
-///   `sec_identity_t` (`TLS.localIdentity(_:)`); a listener without an
-///   identity fails the handshake with `-9810` (verified at runtime).
-///   Issuing a self-signed certificate belongs to an identity layer that's
-///   out of scope for now. Consequence: traffic travels **unencrypted** on
-///   the local network and peer identity is **not verified**.
+/// Control traffic uses `Coder<P2PFrame> / TCP / IP`; bulk traffic uses
+/// authenticated QUIC streams over UDP/IP. Both services use Bonjour and
+/// peer-to-peer networking.
 @MainActor
 public final class NetworkPeerTransport: PeerTransport {
+
+    private static let logger = Logger(subsystem: "com.zafir.nexo", category: "transport")
 
     // MARK: - Network Types
 
@@ -30,6 +27,9 @@ public final class NetworkPeerTransport: PeerTransport {
     fileprivate typealias Parameters = NWParametersBuilder<ApplicationProtocol>
     fileprivate typealias Connection = NetworkConnection<ApplicationProtocol>
     fileprivate typealias Listener = NetworkListener<ApplicationProtocol>
+    fileprivate typealias QUICParameters = NWParametersBuilder<QUIC>
+    fileprivate typealias QUICConnection = NetworkConnection<QUIC>
+    fileprivate typealias QUICListener = NetworkListener<QUIC>
 
     // MARK: - PeerConnectionBox
 
@@ -90,6 +90,8 @@ public final class NetworkPeerTransport: PeerTransport {
     // MARK: - Identity and advertisement
 
     private let applicationID: String
+    private let localCertificateFingerprint: String?
+    private let tlsConfiguration: NexoTLSConfiguration?
     private var advertisement: AdvertisementRecord
 
     /// Bonjour service name. Derived from `applicationID`, not the display
@@ -102,9 +104,13 @@ public final class NetworkPeerTransport: PeerTransport {
     public private(set) var epoch: UInt64 = 0
     private var isAdvertising = false
     private var isBrowsing = false
+    private var localNetworkPermissionState: LocalNetworkPermissionState = .unknown
     private var listener: Listener?
     private var listenerTask: Task<Void, Never>?
+    private var quicListener: QUICListener?
+    private var quicListenerTask: Task<Void, Never>?
     private var browserTask: Task<Void, Never>?
+    private var quicBrowserTask: Task<Void, Never>?
 
     // MARK: - Events
 
@@ -113,10 +119,13 @@ public final class NetworkPeerTransport: PeerTransport {
 
     public var events: AsyncStream<PeerTransportEvent> { eventStream }
 
+    public var isTLSConfigured: Bool { tlsConfiguration != nil }
+
     // MARK: - Discovery
 
     private var advertisements: [TransportPeerID: PeerAdvertisement] = [:]
     private var endpoints: [TransportPeerID: Bonjour.Endpoint] = [:]
+    private var quicEndpointsByApplicationID: [String: Bonjour.Endpoint] = [:]
 
     // MARK: - Connections
 
@@ -124,6 +133,21 @@ public final class NetworkPeerTransport: PeerTransport {
     private var boxes: [TransportPeerID: PeerConnectionBox] = [:]
     /// Winning connection per peer, once handshaken.
     private var connectionIDsByApplicationID: [String: TransportPeerID] = [:]
+    private var binaryTransportsByApplicationID: [String: NexoQUICBinaryTransport] = [:]
+    private var binaryIncomingTasksByApplicationID: [String: Task<Void, Never>] = [:]
+
+    private let incomingBinaryStream: AsyncStream<NexoQUICIncomingStream>
+    private let incomingBinaryContinuation: AsyncStream<NexoQUICIncomingStream>.Continuation
+    private let incomingPeerBinaryStream: AsyncStream<NexoPeerBinaryStream>
+    private let incomingPeerBinaryContinuation: AsyncStream<NexoPeerBinaryStream>.Continuation
+
+    public var incomingBinaryStreams: AsyncStream<NexoQUICIncomingStream> {
+        incomingBinaryStream
+    }
+
+    public var incomingPeerBinaryStreams: AsyncStream<NexoPeerBinaryStream> {
+        incomingPeerBinaryStream
+    }
 
     public var connectedPeers: [ConnectedPeer] {
         connectionIDsByApplicationID.values.compactMap { boxes[$0]?.peer }
@@ -131,8 +155,15 @@ public final class NetworkPeerTransport: PeerTransport {
 
     // MARK: - Init
 
-    public init(applicationID: String, displayName: String) {
+    public init(
+        applicationID: String,
+        displayName: String,
+        tlsConfiguration: NexoTLSConfiguration? = nil,
+        localCertificateFingerprint: String? = nil
+    ) {
         self.applicationID = applicationID
+        self.localCertificateFingerprint = localCertificateFingerprint
+        self.tlsConfiguration = tlsConfiguration
         self.advertisement = AdvertisementRecord(
             applicationID: applicationID,
             displayName: displayName
@@ -141,12 +172,27 @@ public final class NetworkPeerTransport: PeerTransport {
         let stream = AsyncStream<PeerTransportEvent>.makeStream()
         self.eventStream = stream.stream
         self.eventContinuation = stream.continuation
+
+        let binaryStream = AsyncStream<NexoQUICIncomingStream>.makeStream()
+        self.incomingBinaryStream = binaryStream.stream
+        self.incomingBinaryContinuation = binaryStream.continuation
+
+        let peerBinaryStream = AsyncStream<NexoPeerBinaryStream>.makeStream()
+        self.incomingPeerBinaryStream = peerBinaryStream.stream
+        self.incomingPeerBinaryContinuation = peerBinaryStream.continuation
     }
 
     deinit {
         listenerTask?.cancel()
+        quicListenerTask?.cancel()
         browserTask?.cancel()
+        quicBrowserTask?.cancel()
+        for task in binaryIncomingTasksByApplicationID.values {
+            task.cancel()
+        }
         eventContinuation.finish()
+        incomingBinaryContinuation.finish()
+        incomingPeerBinaryContinuation.finish()
     }
 
     // MARK: - Lifecycle
@@ -159,12 +205,15 @@ public final class NetworkPeerTransport: PeerTransport {
         epoch &+= 1
         isAdvertising = advertising
         isBrowsing = browsing
+        updateLocalNetworkPermission(.unknown)
 
         if advertisingChanged {
             syncListener()
+            syncQUICListener()
         }
         if browsingChanged {
             syncBrowser()
+            syncQUICBrowser()
         }
 
         emit(.lifecycleChanged(.active, epoch: epoch))
@@ -183,8 +232,19 @@ public final class NetworkPeerTransport: PeerTransport {
         listenerTask?.cancel()
         listenerTask = nil
         listener = nil
+        quicListenerTask?.cancel()
+        quicListenerTask = nil
+        quicListener = nil
         browserTask?.cancel()
         browserTask = nil
+        quicBrowserTask?.cancel()
+        quicBrowserTask = nil
+        for task in binaryIncomingTasksByApplicationID.values {
+            task.cancel()
+        }
+        binaryIncomingTasksByApplicationID.removeAll()
+        quicEndpointsByApplicationID.removeAll()
+        binaryTransportsByApplicationID.removeAll()
 
         // Established peers must be notified: otherwise the domain keeps
         // thinking they're connected and never re-marks them after background.
@@ -228,6 +288,12 @@ public final class NetworkPeerTransport: PeerTransport {
         var service = listener.service
         service?.txtRecordObject = NWTXTRecord(record.txtDictionary)
         listener.service = service
+
+        if let quicListener {
+            var quicService = quicListener.service
+            quicService?.txtRecordObject = NWTXTRecord(record.txtDictionary)
+            quicListener.service = quicService
+        }
 
         // The display name travels in TXT, so a rename doesn't force
         // recreating the listener either.
@@ -303,6 +369,39 @@ public final class NetworkPeerTransport: PeerTransport {
 
         queue.enqueue(envelope)
     }
+
+    /// Opens a QUIC binary stream after the JSON connection has negotiated it.
+    public func openBinaryStream(
+        to applicationID: String,
+        descriptor: NexoStreamDescriptor
+    ) async throws -> NexoQUICByteStream {
+        guard let connectionID = connectionIDsByApplicationID[applicationID],
+              let peer = boxes[connectionID]?.peer,
+              peer.supports(.binaryStreams)
+        else {
+            throw P2PTransportError.connectionFailed("El peer no admite streams binarios.")
+        }
+
+        guard let endpoint = quicEndpointsByApplicationID[applicationID] else {
+            throw P2PTransportError.peerNotDiscovered
+        }
+
+        let transport: NexoQUICBinaryTransport
+        if let existing = binaryTransportsByApplicationID[applicationID] {
+            transport = existing
+        } else {
+            transport = NexoQUICBinaryTransport.connect(
+                to: endpoint.nwEndpoint,
+                applicationID: self.applicationID,
+                expectedRemoteApplicationID: applicationID,
+                tlsConfiguration: tlsConfiguration
+            )
+            binaryTransportsByApplicationID[applicationID] = transport
+            startIncomingBinaryStreams(from: transport, for: applicationID)
+        }
+
+        return try await transport.openStream(descriptor)
+    }
 }
 
 // MARK: - Network stack
@@ -311,7 +410,20 @@ public final class NetworkPeerTransport: PeerTransport {
 private extension NetworkPeerTransport {
 
     func makeParameters() -> Parameters {
-        NWParametersBuilder(auto: {
+        if let tlsConfiguration {
+            return NWParametersBuilder(auto: {
+                Coder(P2PFrame.self, using: .json) {
+                    tlsConfiguration.configure(TLS {
+                        TCP {
+                            IP()
+                        }
+                    })
+                }
+            })
+            .peerToPeerIncluded(true)
+        }
+
+        return NWParametersBuilder(auto: {
             Coder(P2PFrame.self, using: .json) {
                 TCP {
                     IP()
@@ -319,6 +431,58 @@ private extension NetworkPeerTransport {
             }
         })
         .peerToPeerIncluded(true)
+    }
+
+    func makeQUICParameters() -> QUICParameters {
+        if let tlsConfiguration {
+            return NWParametersBuilder(auto: {
+                tlsConfiguration.configure(QUIC(
+                    alpn: ["nexo-binary-v1"],
+                    { UDP { IP() } }
+                ))
+            })
+            .peerToPeerIncluded(true)
+        }
+
+        return NWParametersBuilder(auto: {
+            QUIC(alpn: ["nexo-binary-v1"], { UDP { IP() } })
+        })
+        .peerToPeerIncluded(true)
+    }
+
+    func syncQUICListener() {
+        quicListenerTask?.cancel()
+        quicListenerTask = nil
+        quicListener = nil
+
+        guard isAdvertising else { return }
+
+        quicListenerTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            do {
+                let listener = try QUICListener(
+                    for: .bonjour(
+                        name: self.serviceName,
+                        type: P2PProtocolInfo.quicServiceType,
+                        domain: nil,
+                        txtRecord: NWTXTRecord(self.advertisement.txtDictionary)
+                    ),
+                    using: self.makeQUICParameters()
+                )
+                self.quicListener = listener
+
+                try await listener.run { [weak self] connection in
+                    guard let self else { return }
+                    try await self.handleIncomingQUIC(connection)
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                Self.logger.error("QUIC listener failed: \(error.localizedDescription, privacy: .public)")
+                self.quicListener = nil
+            }
+        }
     }
 
     func syncListener() {
@@ -350,7 +514,11 @@ private extension NetworkPeerTransport {
             } catch is CancellationError {
                 return
             } catch {
+                Self.logger.error("TCP listener failed: \(error.localizedDescription, privacy: .public)")
                 self.listener = nil
+                if self.isLocalNetworkPermissionDenied(error) {
+                    self.updateLocalNetworkPermission(.denied)
+                }
                 self.emit(.lifecycleChanged(.disconnected, epoch: self.epoch))
             }
         }
@@ -381,14 +549,71 @@ private extension NetworkPeerTransport {
 
             do {
                 try await browser.run { [weak self] endpoints in
+                    self?.updateLocalNetworkPermission(.available)
                     self?.updateAdvertisements(endpoints)
                 }
             } catch is CancellationError {
                 return
             } catch {
+                Self.logger.error("TCP browser failed: \(error.localizedDescription, privacy: .public)")
                 self.clearAdvertisements()
+                if self.isLocalNetworkPermissionDenied(error) {
+                    self.updateLocalNetworkPermission(.denied)
+                }
             }
         }
+    }
+
+    func syncQUICBrowser() {
+        quicBrowserTask?.cancel()
+        quicBrowserTask = nil
+
+        guard isBrowsing else {
+            quicEndpointsByApplicationID.removeAll()
+            return
+        }
+
+        quicBrowserTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            let browser = NetworkBrowser(
+                for: .bonjour(
+                    P2PProtocolInfo.quicServiceType,
+                    domain: nil,
+                    includeTxtRecord: true
+                ),
+                using: NWParameters().peerToPeerIncluded(true)
+            )
+
+            do {
+                try await browser.run { [weak self] endpoints in
+                    self?.updateQUICEndpoints(endpoints)
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                Self.logger.error("QUIC browser failed: \(error.localizedDescription, privacy: .public)")
+                self.quicEndpointsByApplicationID.removeAll()
+            }
+        }
+    }
+
+    func updateLocalNetworkPermission(_ state: LocalNetworkPermissionState) {
+        guard localNetworkPermissionState != state else { return }
+        localNetworkPermissionState = state
+        emit(.localNetworkPermissionChanged(state, epoch: epoch))
+    }
+
+    func isLocalNetworkPermissionDenied(_ error: any Error) -> Bool {
+        if let networkError = error as? NWError,
+           case .posix(.EACCES) = networkError {
+            return true
+        }
+
+        let description = String(describing: error) + " " + error.localizedDescription
+        return description.localizedCaseInsensitiveContains("PolicyDenied")
+            || description.localizedCaseInsensitiveContains("policy denied")
+            || description.localizedCaseInsensitiveContains("LocalNetwork")
     }
 
     func updateAdvertisements(_ discovered: [Bonjour.Endpoint]) {
@@ -447,6 +672,24 @@ private extension NetworkPeerTransport {
         advertisements.removeAll()
         endpoints.removeAll()
     }
+
+    func updateQUICEndpoints(_ discovered: [Bonjour.Endpoint]) {
+        var seen: Set<String> = []
+
+        for endpoint in discovered {
+            guard let applicationID = endpoint.txtRecord.dictionary["aid"],
+                  applicationID != self.applicationID else { continue }
+
+            seen.insert(applicationID)
+            quicEndpointsByApplicationID[applicationID] = endpoint
+        }
+
+        for applicationID in quicEndpointsByApplicationID.keys
+        where !seen.contains(applicationID) {
+            quicEndpointsByApplicationID.removeValue(forKey: applicationID)
+            binaryTransportsByApplicationID.removeValue(forKey: applicationID)
+        }
+    }
 }
 
 // MARK: - Handshake and receiving
@@ -463,6 +706,51 @@ private extension NetworkPeerTransport {
         if let receiveTask = box.receiveTask {
             await receiveTask.value
         }
+    }
+
+    func handleIncomingQUIC(_ connection: QUICConnection) async throws {
+        let transport = NexoQUICBinaryTransport(
+            connection: connection,
+            applicationID: applicationID
+        )
+        let streams = await transport.startIncoming()
+
+        for try await stream in streams {
+            binaryTransportsByApplicationID[stream.peerApplicationID] = transport
+            acceptIncomingBinaryStream(stream)
+        }
+    }
+
+    func startIncomingBinaryStreams(
+        from transport: NexoQUICBinaryTransport,
+        for applicationID: String
+    ) {
+        let streams = Task { await transport.startIncoming() }
+        binaryIncomingTasksByApplicationID[applicationID]?.cancel()
+        binaryIncomingTasksByApplicationID[applicationID] = Task { @MainActor [weak self] in
+            let incoming = await streams.value
+            do {
+                for try await stream in incoming {
+                    self?.acceptIncomingBinaryStream(stream)
+                }
+            } catch {
+                return
+            }
+        }
+    }
+
+    func acceptIncomingBinaryStream(_ stream: NexoQUICIncomingStream) {
+        guard let connectionID = connectionIDsByApplicationID[stream.peerApplicationID],
+              let peer = boxes[connectionID]?.peer,
+              peer.supports(.binaryStreams)
+        else { return }
+
+        incomingBinaryContinuation.yield(stream)
+        incomingPeerBinaryContinuation.yield(NexoPeerBinaryStream(
+            peer: peer,
+            descriptor: stream.descriptor,
+            stream: stream.stream
+        ))
     }
 
     @discardableResult
@@ -512,7 +800,8 @@ private extension NetworkPeerTransport {
     func sendHello(on box: PeerConnectionBox) {
         let body = HelloBody(
             applicationID: applicationID,
-            displayName: advertisement.displayName
+            displayName: advertisement.displayName,
+            certificateFingerprint: localCertificateFingerprint
         )
 
         Task { @MainActor [weak self, weak box] in
@@ -615,6 +904,7 @@ private extension NetworkPeerTransport {
         let peer = ConnectedPeer(
             applicationID: body.applicationID,
             displayName: body.displayName.isEmpty ? "Dispositivo cercano" : body.displayName,
+            certificateFingerprint: body.certificateFingerprint,
             protocolVersion: body.protocolVersion,
             capabilities: Set(body.capabilities),
             connectionSessionID: box.sessionID
@@ -667,6 +957,8 @@ private extension NetworkPeerTransport {
         // Only clean up the index if this was the peer's current connection.
         if connectionIDsByApplicationID[peer.applicationID] == box.connectionID {
             connectionIDsByApplicationID.removeValue(forKey: peer.applicationID)
+            binaryIncomingTasksByApplicationID.removeValue(forKey: peer.applicationID)?.cancel()
+            binaryTransportsByApplicationID.removeValue(forKey: peer.applicationID)
             emit(.peerDisconnected(
                 applicationID: peer.applicationID,
                 reason: error.localizedDescription,

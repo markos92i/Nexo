@@ -56,5 +56,28 @@ No change to the transport, the envelope format, or `RoomCoordinator` is ever re
 ## Design notes
 
 - Peers identify themselves with a self-declared `applicationID` — it is **not verified**. Treat every remote payload as untrusted.
-- The default transport does **not** encrypt traffic (see the note on `NetworkPeerTransport`). Do not send sensitive data over it as-is.
+- `NetworkPeerTransport` encrypts traffic when supplied with `NexoTLSConfiguration`; the Zafir app creates that configuration automatically for every device.
 - Bonjour TXT records are capped at 255 bytes per entry — anything published there is budgeted in UTF-8 bytes.
+
+## Local P2P identity
+
+The normal app flow requires no backend or certificate bundle. `NexoLocalTLSIdentity.loadOrCreate(applicationID:)` generates a P-256 key in Keychain, creates a self-signed X.509 certificate locally, and exposes the resulting `sec_identity_t` through `makeTLSConfiguration()`. The private key never leaves the device.
+
+The encrypted handshake exchanges the certificate public-key fingerprint. The app stores fingerprints accepted from the room menu in Keychain. TLS protects an unpaired connection, but the room lock is shown as verified only after every remote participant has been paired locally.
+
+## Managed-fleet TLS
+
+For a controlled device fleet, use a private CA and issue one mTLS identity per device. The generator at `Scripts/generate-production-pki.sh` writes credentials outside the repository by default and refuses to overwrite an existing output directory.
+
+```sh
+Scripts/generate-production-pki.sh /secure/path/nexo-production zafir-device-01
+```
+
+Distribute only the device `.p12` and its password to that device. Keep the CA private key offline or in a secrets manager, and distribute only `NexoProductionCA.cert.pem` to the application. Import the identity into Keychain, convert it with `sec_identity_create`, and configure Nexo with a validator that trusts this CA or pins the device public key. Do not ship the CA private key, password files, or generated PKCS#12 files in the app source tree.
+
+The generated leaf certificate has `serverAuth` and `clientAuth` EKUs and these SANs:
+
+- `urn:zafir:nexo:device:<device-name>`
+- `<device-name>.local`
+
+Generate a new leaf for every device. Do not reuse `zafir-device-01` credentials across the fleet.

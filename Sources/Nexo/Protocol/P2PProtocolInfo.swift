@@ -23,11 +23,14 @@ public enum P2PProtocolInfo {
         .chat,
         .activities,
         .fileTransfer,
-        .coalescedSnapshots
+        .coalescedSnapshots,
+        .binaryStreams,
+        .tls
     ]
 
     /// Must match `NSBonjourServices` in the app's Info.plist.
     public static let serviceType = "_zafir-nearby._tcp"
+    public static let quicServiceType = "_zafir-nearby._udp"
 
     public static func isCompatible(remoteVersion: UInt8) -> Bool {
         remoteVersion >= minimumVersion
@@ -42,6 +45,8 @@ public enum P2PCapability: String, Codable, Sendable, CaseIterable {
     case activities
     case fileTransfer
     case coalescedSnapshots
+    case binaryStreams
+    case tls
 }
 
 // MARK: - P2PLimits
