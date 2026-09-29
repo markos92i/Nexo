@@ -5,7 +5,7 @@ import PackageDescription
 let package = Package(
     name: "Nexo",
     platforms: [
-       .macOS(.v26), .iOS(.v26),
+        .macOS(.v26), .iOS(.v26),
     ],
     products: [
         .library(
