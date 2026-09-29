@@ -108,8 +108,7 @@ public final class RoomSession: Identifiable {
         self.descriptor.memberCount = sanitized.count
 
         for member in sanitized
-        where !previous.contains(member.applicationID)
-            && member.applicationID != identity.applicationID {
+        where !previous.contains(member.applicationID) {
             chat?.memberDidJoin(member)
         }
 

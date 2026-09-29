@@ -219,7 +219,8 @@ public final class RoomCoordinator {
                 send(
                     .joinRoomRequest(JoinRoomRequestPayload(
                         roomID: room.id,
-                        displayName: identity.displayName
+                        displayName: identity.displayName,
+                        avatar: identity.avatar
                     )),
                     to: [room.descriptor.hostApplicationID],
                     roomID: room.id
@@ -333,7 +334,12 @@ public final class RoomCoordinator {
             return
         }
 
-        admit(applicationID: request.applicationID, displayName: request.displayName, to: session)
+        admit(
+            applicationID: request.applicationID,
+            displayName: request.displayName,
+            avatar: request.avatar,
+            to: session
+        )
     }
 
     // MARK: - Activities
@@ -558,7 +564,8 @@ public extension RoomCoordinator {
             send(
                 .joinRoomRequest(JoinRoomRequestPayload(
                     roomID: session.roomID,
-                    displayName: identity.displayName
+                    displayName: identity.displayName,
+                    avatar: identity.avatar
                 )),
                 to: [peer.applicationID],
                 roomID: session.roomID
@@ -952,9 +959,12 @@ private extension RoomCoordinator {
         guard session.features.hasChat,
               let chat = session.chat else { return }
 
+        // System notices are generated per device (join/leave wording is
+        // first-person for the local member), so they never travel in history.
         let messages = chat.messages.filter {
-            !onlyMessagesAuthoredByLocal
-                || $0.senderApplicationID == identity.applicationID
+            $0.kind != .systemInfo
+                && (!onlyMessagesAuthoredByLocal
+                    || $0.senderApplicationID == identity.applicationID)
         }
         guard !messages.isEmpty else { return }
 
@@ -1129,13 +1139,19 @@ private extension RoomCoordinator {
 
         switch session.descriptor.accessPolicy {
         case .open:
-            admit(applicationID: peer.applicationID, displayName: payload.displayName, to: session)
+            admit(
+                applicationID: peer.applicationID,
+                displayName: payload.displayName,
+                avatar: payload.avatar,
+                to: session
+            )
 
         case .approval:
             let request = RoomJoinRequest(
                 roomID: payload.roomID,
                 applicationID: peer.applicationID,
-                displayName: payload.displayName
+                displayName: payload.displayName,
+                avatar: payload.avatar
             )
             guard session.enqueueJoinRequest(request) else { return }
 
@@ -1182,13 +1198,19 @@ private extension RoomCoordinator {
         finishJoin(payload.descriptor.id, result: .success(session))
     }
 
-    func admit(applicationID: String, displayName: String, to session: RoomSession) {
+    func admit(
+        applicationID: String,
+        displayName: String,
+        avatar: String?,
+        to session: RoomSession
+    ) {
         var members = session.members
         if !members.contains(where: { $0.applicationID == applicationID }) {
             members.append(RoomMember(
                 applicationID: applicationID,
                 displayName: displayName,
-                role: .guest
+                role: .guest,
+                avatar: avatar
             ))
         }
         session.apply(members: members)

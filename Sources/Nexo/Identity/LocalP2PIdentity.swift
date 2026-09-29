@@ -281,14 +281,23 @@ public final class LocalP2PIdentity {
 
     public let applicationID: String
     public var displayName: String
+    /// Opaque avatar token (catalog key or encoded thumbnail) published to
+    /// peers alongside the display name.
+    public var avatar: String?
 
-    public init(applicationID: String, displayName: String) {
+    public init(applicationID: String, displayName: String, avatar: String? = nil) {
         self.applicationID = applicationID
         self.displayName = displayName
+        self.avatar = avatar
     }
 
     public func member(role: RoomRole) -> RoomMember {
-        RoomMember(applicationID: applicationID, displayName: displayName, role: role)
+        RoomMember(
+            applicationID: applicationID,
+            displayName: displayName,
+            role: role,
+            avatar: avatar
+        )
     }
 }
 

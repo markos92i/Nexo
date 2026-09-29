@@ -57,6 +57,13 @@ public struct RoomDirectoryPayload: Codable, Sendable {
 public struct JoinRoomRequestPayload: Codable, Sendable {
     public let roomID: RoomID
     public let displayName: String
+    public let avatar: String?
+
+    public init(roomID: RoomID, displayName: String, avatar: String? = nil) {
+        self.roomID = roomID
+        self.displayName = displayName
+        self.avatar = avatar
+    }
 }
 
 public struct JoinRoomAcceptedPayload: Codable, Sendable {

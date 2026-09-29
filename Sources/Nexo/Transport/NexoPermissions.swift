@@ -229,15 +229,7 @@ private actor ProbeState {
     }
     
     private func isPermissionDeniedError(_ error: NWError) -> Bool {
-        switch error {
-        case .posix(.EACCES), .posix(.EPERM):
-            return true
-        default:
-            let description = String(describing: error)
-            return description.localizedCaseInsensitiveContains("PolicyDenied")
-                || description.localizedCaseInsensitiveContains("policy denied")
-                || description.localizedCaseInsensitiveContains("LocalNetwork")
-        }
+        NexoLocalNetworkPermission.isDenied(error)
     }
 }
 

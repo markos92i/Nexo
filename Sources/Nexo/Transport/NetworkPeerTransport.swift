@@ -613,15 +613,7 @@ private extension NetworkPeerTransport {
     }
 
     func isLocalNetworkPermissionDenied(_ error: any Error) -> Bool {
-        if let networkError = error as? NWError,
-           case .posix(.EACCES) = networkError {
-            return true
-        }
-
-        let description = String(describing: error) + " " + error.localizedDescription
-        return description.localizedCaseInsensitiveContains("PolicyDenied")
-            || description.localizedCaseInsensitiveContains("policy denied")
-            || description.localizedCaseInsensitiveContains("LocalNetwork")
+        NexoLocalNetworkPermission.isDenied(error)
     }
 
     func updateAdvertisements(_ discovered: [Bonjour.Endpoint]) {
@@ -977,5 +969,32 @@ private extension NetworkPeerTransport {
 
     func emit(_ event: PeerTransportEvent) {
         eventContinuation.yield(event)
+    }
+}
+
+// MARK: - NexoLocalNetworkPermission
+
+enum NexoLocalNetworkPermission {
+    /// mDNSResponder rechaza escuchar y buscar con `kDNSServiceErr_NoAuth`
+    /// (-65555) cuando el permiso de red local no está concedido, y NWError lo
+    /// envuelve como `.dns`: sin mirarlo explícitamente la denegación pasaría
+    /// por un fallo genérico y la UI nunca la reflejaría.
+    static func isDenied(_ error: any Error) -> Bool {
+        if let networkError = error as? NWError {
+            switch networkError {
+            case .posix(.EACCES), .posix(.EPERM):
+                return true
+            case .dns(let code) where code == -65555:
+                return true
+            default:
+                break
+            }
+        }
+
+        let description = String(describing: error) + " " + error.localizedDescription
+        return description.localizedCaseInsensitiveContains("PolicyDenied")
+            || description.localizedCaseInsensitiveContains("policy denied")
+            || description.localizedCaseInsensitiveContains("LocalNetwork")
+            || description.localizedCaseInsensitiveContains("NoAuth")
     }
 }

@@ -228,7 +228,8 @@ public final class ChatRoomSession {
     public func merge(messages: [ChatMessage]) -> Bool {
         var didChange = false
 
-        for original in messages where original.roomID == roomID {
+        for original in messages
+        where original.roomID == roomID && original.kind != .systemInfo {
             var message = original
             message.body = String(message.body.prefix(4_000))
             if let invitation = message.invitation, invitation.roomID != roomID {
@@ -253,7 +254,11 @@ public final class ChatRoomSession {
     }
 
     public func memberDidJoin(_ member: RoomMember) {
-        appendSystemMessage("\(member.displayName) se ha unido.")
+        if member.applicationID == identity.applicationID {
+            appendSystemMessage("Te has unido.")
+        } else {
+            appendSystemMessage("\(member.displayName) se ha unido.")
+        }
     }
 
     public func memberDidLeave(_ member: RoomMember) {

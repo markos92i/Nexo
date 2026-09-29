@@ -89,13 +89,22 @@ public struct RoomMember: Codable, Hashable, Sendable, Identifiable {
     public let applicationID: String
     public let displayName: String
     public let role: RoomRole
+    /// Opaque avatar token chosen by the peer (catalog key or encoded
+    /// thumbnail). Absent in peers predating the field.
+    public let avatar: String?
 
     public var id: String { applicationID }
 
-    public init(applicationID: String, displayName: String, role: RoomRole) {
+    public init(
+        applicationID: String,
+        displayName: String,
+        role: RoomRole,
+        avatar: String? = nil
+    ) {
         self.applicationID = applicationID
         self.displayName = displayName
         self.role = role
+        self.avatar = avatar
     }
 
     public var isHost: Bool { role == .host }
@@ -179,6 +188,7 @@ public struct RoomJoinRequest: Identifiable, Sendable, Equatable {
     public let roomID: RoomID
     public let applicationID: String
     public let displayName: String
+    public let avatar: String?
     public let receivedAt: Date
 
     public init(
@@ -186,12 +196,14 @@ public struct RoomJoinRequest: Identifiable, Sendable, Equatable {
         roomID: RoomID,
         applicationID: String,
         displayName: String,
+        avatar: String? = nil,
         receivedAt: Date = Date()
     ) {
         self.id = id
         self.roomID = roomID
         self.applicationID = applicationID
         self.displayName = displayName
+        self.avatar = avatar
         self.receivedAt = receivedAt
     }
 }
