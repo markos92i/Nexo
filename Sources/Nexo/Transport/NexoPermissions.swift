@@ -9,47 +9,47 @@ import OSLog
 
 // MARK: - NexoPermissionState
 
-/// Estado de un permiso requerido para la comunicación P2P.
+/// State of a permission required for P2P communication.
 public enum NexoPermissionState: String, Sendable, Equatable, CaseIterable {
-    /// El estado del permiso aún no se ha determinado.
+    /// Permission state not yet determined.
     case unknown
-    /// El permiso está concedido y disponible.
+    /// Permission granted and available.
     case granted
-    /// El permiso fue denegado por el usuario o el sistema.
+    /// Permission denied by the user or the system.
     case denied
-    /// El permiso está restringido por políticas del dispositivo (MDM, parental controls).
+    /// Permission restricted by device policy (MDM, parental controls).
     case restricted
-    /// El dispositivo no soporta esta funcionalidad.
+    /// The device doesn't support this capability.
     case unsupported
 }
 
 // MARK: - NexoPermissionKind
 
-/// Tipos de permisos que Nexo puede requerir.
+/// Permission types Nexo may require.
 public enum NexoPermissionKind: String, Sendable, CaseIterable {
-    /// Permiso de red local (Bonjour, mDNS). Requerido para descubrir peers.
+    /// Local network permission (Bonjour, mDNS). Required to discover peers.
     case localNetwork
-    /// Permiso de Bluetooth (futuro). Podría usarse como fallback.
+    /// Bluetooth permission (future). Could serve as a fallback.
     case bluetooth
-    /// Permiso de Wi-Fi Aware / AWDL (implícito en localNetwork en iOS).
+    /// Wi-Fi Aware / AWDL permission (implicit in localNetwork on iOS).
     case peerToPeerWiFi
 }
 
 // MARK: - NexoPermissionsStatus
 
-/// Estado agregado de todos los permisos necesarios para P2P.
+/// Aggregated state of all permissions needed for P2P.
 @MainActor
 @Observable
 public final class NexoPermissionsStatus {
-    /// Estado del permiso de red local.
+    /// Local network permission state.
     public private(set) var localNetwork: NexoPermissionState = .unknown
-    /// Fecha del último chequeo de permisos.
+    /// Date of the last permission check.
     public private(set) var lastChecked: Date?
-    /// Si todos los permisos requeridos están concedidos.
+    /// Whether all required permissions are granted.
     public var isFullyGranted: Bool {
         localNetwork == .granted
     }
-    /// Si algún permiso crítico está denegado.
+    /// Whether any critical permission is denied.
     public var hasCriticalDenial: Bool {
         localNetwork == .denied || localNetwork == .restricted
     }
@@ -62,33 +62,21 @@ public final class NexoPermissionsStatus {
 
 // MARK: - NexoPermissionsChecker
 
-/// Verificador de permisos necesarios para comunicación P2P.
+/// Checks the permissions needed for P2P communication.
 ///
-/// En iOS, el permiso de "Local Network" se solicita automáticamente cuando
-/// la app intenta usar Bonjour o conectarse a dispositivos en la red local.
-/// Este checker permite:
-/// - Verificar proactivamente si el permiso está disponible
-/// - Detectar cuándo el usuario ha denegado el permiso
-/// - Proporcionar orientación sobre cómo habilitarlo en Ajustes
-///
-/// ## Uso típico
-/// ```swift
-/// let checker = NexoPermissionsChecker()
-/// await checker.checkPermissions()
-///
-/// if checker.status.hasCriticalDenial {
-///     // Mostrar UI explicando cómo habilitar en Ajustes
-/// }
-/// ```
+/// iOS requests the "Local Network" permission automatically when the app
+/// uses Bonjour or connects to devices on the local network. This checker
+/// verifies proactively, detects user denial, and provides guidance for
+/// re-enabling the permission in Settings.
 @MainActor
 public final class NexoPermissionsChecker {
     
     private static let logger = Logger(subsystem: "com.zafir.nexo", category: "permissions")
     
-    /// Estado observable de permisos.
+    /// Observable permission state.
     public let status = NexoPermissionsStatus()
     
-    /// Callback cuando cambia el estado de permisos.
+    /// Callback fired when permission state changes.
     public var onPermissionChange: (@MainActor @Sendable (NexoPermissionKind, NexoPermissionState) -> Void)?
     
     private var checkTask: Task<Void, Never>?
@@ -103,11 +91,11 @@ public final class NexoPermissionsChecker {
     
     // MARK: - Public API
     
-    /// Verifica el estado actual de todos los permisos necesarios.
+    /// Checks the current state of all required permissions.
     ///
-    /// Esta operación intenta una conexión de prueba mínima para determinar
-    /// si el permiso de red local está disponible. En iOS, esto puede
-    /// disparar el diálogo de permiso si es la primera vez.
+    /// Performs a minimal probe connection to determine whether local network
+    /// permission is available. On iOS this can trigger the permission dialog
+    /// on first use.
     public func checkPermissions() async {
         checkTask?.cancel()
         checkTask = Task { @MainActor in
@@ -116,7 +104,7 @@ public final class NexoPermissionsChecker {
         await checkTask?.value
     }
     
-    /// Verifica solo el permiso de red local.
+    /// Checks only the local network permission.
     public func checkLocalNetworkPermission() async {
         let state = await LocalNetworkProber.probe()
         let previousState = status.localNetwork
@@ -128,10 +116,10 @@ public final class NexoPermissionsChecker {
         }
     }
     
-    /// Inicia monitoreo continuo del estado de permisos.
+    /// Starts continuous monitoring of permission state.
     ///
-    /// Útil para detectar cuando el usuario cambia permisos en Ajustes
-    /// mientras la app está en primer plano.
+    /// Detects when the user changes permissions in Settings while the app
+    /// is in the foreground.
     public func startMonitoring(interval: TimeInterval = 5.0) {
         stopMonitoring()
         
@@ -143,13 +131,13 @@ public final class NexoPermissionsChecker {
         }
     }
     
-    /// Detiene el monitoreo continuo.
+    /// Stops continuous monitoring.
     public func stopMonitoring() {
         monitorTask?.cancel()
         monitorTask = nil
     }
     
-    /// Información para guiar al usuario a habilitar permisos.
+    /// Guidance to help the user enable permissions.
     public var settingsGuidance: NexoPermissionsGuidance {
         NexoPermissionsGuidance(localNetworkState: status.localNetwork)
     }
@@ -157,14 +145,13 @@ public final class NexoPermissionsChecker {
 
 // MARK: - LocalNetworkProber
 
-/// Probing aislado para evitar problemas de concurrencia con NWBrowser callbacks.
+/// Isolated probing to avoid concurrency issues with NWBrowser callbacks.
 private actor LocalNetworkProber {
     
-    /// Intenta una operación de red mínima para verificar el permiso.
+    /// Attempts a minimal network operation to check the permission.
     ///
-    /// iOS no proporciona una API directa para consultar el estado del
-    /// permiso de red local. La única forma fiable es intentar una
-    /// operación y observar si falla con un error de política.
+    /// iOS provides no direct API for local network permission status; the
+    /// only reliable way is to attempt an operation and watch for a policy error.
     static func probe() async -> NexoPermissionState {
         await withCheckedContinuation { continuation in
             let browser = NWBrowser(
@@ -172,7 +159,7 @@ private actor LocalNetworkProber {
                 using: NWParameters()
             )
             
-            // Usamos una referencia a actor para manejar el estado de "ya respondido"
+            // Actor-owned state guards against resuming the continuation twice
             let state = ProbeState()
             
             browser.stateUpdateHandler = { browserState in
@@ -183,7 +170,7 @@ private actor LocalNetworkProber {
             
             browser.start(queue: .global())
             
-            // Timeout: si no hay respuesta en 3 segundos, asumimos granted
+            // Timeout: if no response within 3 seconds, assume granted
             Task {
                 try? await Task.sleep(for: .seconds(3))
                 await state.resumeIfNeeded(with: .granted, browser: browser, continuation: continuation)
@@ -192,7 +179,7 @@ private actor LocalNetworkProber {
     }
 }
 
-/// Estado del probe manejado de forma thread-safe.
+/// Probe state handled in a thread-safe way.
 private actor ProbeState {
     private var hasResumed = false
     
@@ -235,22 +222,22 @@ private actor ProbeState {
 
 // MARK: - NexoPermissionsGuidance
 
-/// Orientación para el usuario sobre cómo habilitar permisos.
+/// Guidance for the user on how to enable permissions.
 public struct NexoPermissionsGuidance: Sendable {
     
-    /// Si se necesita acción del usuario.
+    /// Whether user action is needed.
     public let needsUserAction: Bool
     
-    /// Título para mostrar al usuario.
+    /// Title shown to the user.
     public let title: String
     
-    /// Mensaje explicativo.
+    /// Explaining message.
     public let message: String
     
-    /// Pasos para habilitar el permiso en Ajustes.
+    /// Steps to enable the permission in Settings.
     public let steps: [String]
     
-    /// Si se puede abrir Ajustes directamente.
+    /// Whether Settings can be opened directly.
     public let canOpenSettings: Bool
     
     public init(localNetworkState: NexoPermissionState) {
@@ -284,7 +271,7 @@ public struct NexoPermissionsGuidance: Sendable {
         }
     }
     
-    /// URL para abrir los ajustes de la app (si está disponible).
+    /// URL to open the app's settings (if available).
     public var settingsURL: URL? {
         URL(string: "App-prefs:")
     }
@@ -294,7 +281,7 @@ public struct NexoPermissionsGuidance: Sendable {
 
 public extension LocalNetworkPermissionState {
     
-    /// Convierte a NexoPermissionState para uso unificado.
+    /// Converts to NexoPermissionState for unified use.
     var asNexoPermissionState: NexoPermissionState {
         switch self {
         case .unknown:
@@ -309,7 +296,7 @@ public extension LocalNetworkPermissionState {
 
 public extension NexoPermissionState {
     
-    /// Convierte a LocalNetworkPermissionState para compatibilidad con el transporte.
+    /// Converts to LocalNetworkPermissionState for transport compatibility.
     var asLocalNetworkPermissionState: LocalNetworkPermissionState {
         switch self {
         case .unknown, .unsupported:

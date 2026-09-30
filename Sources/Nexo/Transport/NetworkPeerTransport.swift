@@ -106,10 +106,10 @@ public final class NetworkPeerTransport: PeerTransport {
     private var isBrowsing = false
     private var _localNetworkPermissionState: LocalNetworkPermissionState = .unknown
     
-    /// Estado actual del permiso de red local.
+    /// Current local network permission state.
     ///
-    /// El estado se actualiza automáticamente cuando el transporte detecta
-    /// errores de permisos al intentar escuchar o buscar peers.
+    /// Updated automatically when the transport hits permission errors while
+    /// trying to listen or browse for peers.
     public var localNetworkPermissionState: LocalNetworkPermissionState {
         _localNetworkPermissionState
     }
@@ -975,10 +975,10 @@ private extension NetworkPeerTransport {
 // MARK: - NexoLocalNetworkPermission
 
 enum NexoLocalNetworkPermission {
-    /// mDNSResponder rechaza escuchar y buscar con `kDNSServiceErr_NoAuth`
-    /// (-65555) cuando el permiso de red local no está concedido, y NWError lo
-    /// envuelve como `.dns`: sin mirarlo explícitamente la denegación pasaría
-    /// por un fallo genérico y la UI nunca la reflejaría.
+    /// mDNSResponder rejects listening and browsing with `kDNSServiceErr_NoAuth`
+    /// (-65555) when local network permission is not granted, and NWError wraps
+    /// it as `.dns`: without checking it explicitly, the denial would surface
+    /// as a generic failure and the UI would never reflect it.
     static func isDenied(_ error: any Error) -> Bool {
         if let networkError = error as? NWError {
             switch networkError {

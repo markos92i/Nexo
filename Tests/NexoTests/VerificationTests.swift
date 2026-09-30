@@ -52,7 +52,7 @@ import Testing
     #expect(words1 == words2)
     
     let wordCount = words1.split(separator: " ").count
-    #expect(wordCount == 6) // 6 palabras
+    #expect(wordCount == 6) // 6 words
 }
 
 @Test func fingerprintCompareIsCaseInsensitive() {
@@ -67,7 +67,7 @@ import Testing
 
 @Test func fingerprintCompareDetectsDifferences() {
     let fp1 = "a3b5c7d9"
-    let fp2 = "a3b5c7d8"  // último dígito diferente
+    let fp2 = "a3b5c7d8"  // last digit different
     
     #expect(NexoFingerprintFormatter.compare(fp1, fp2) == false)
 }
@@ -171,13 +171,13 @@ import Testing
         lastVerifiedAt: nil
     )
     
-    // El fingerprint formateado debe tener espacios
+    // The formatted fingerprint must contain spaces
     #expect(info.formattedFingerprint.contains(" "))
     
-    // Los emojis deben ser consistentes
+    // The emojis must be consistent
     #expect(info.emojiFingerprint.isEmpty == false)
     
-    // Las palabras deben ser consistentes
+    // The words must be consistent
     #expect(info.wordFingerprint.isEmpty == false)
 }
 
@@ -186,6 +186,6 @@ import Testing
 @Test func verificationStatesAreMutuallyExclusive() {
     let states: [NexoPeerVerificationState] = [.unknown, .trustedOnFirstUse, .verified, .identityChanged]
     
-    // Cada estado debe ser único
+    // Every state must be unique
     #expect(Set(states).count == states.count)
 }

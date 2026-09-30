@@ -18,12 +18,12 @@ import CryptoKit
     let fingerprint2 = NexoFingerprintFormatter.fingerprint(of: publicKeyData)
     
     #expect(fingerprint1 == fingerprint2)
-    #expect(fingerprint1.count == 64) // SHA-256 produce 32 bytes = 64 hex chars
+    #expect(fingerprint1.count == 64) // SHA-256 produces 32 bytes = 64 hex chars
 }
 
 @Test func fingerprintGenerationDifferentKeysAreDifferent() {
     let key1 = Data([0x01, 0x02, 0x03, 0x04])
-    let key2 = Data([0x01, 0x02, 0x03, 0x05])  // Un byte diferente
+    let key2 = Data([0x01, 0x02, 0x03, 0x05])  // One different byte
     
     let fp1 = NexoFingerprintFormatter.fingerprint(of: key1)
     let fp2 = NexoFingerprintFormatter.fingerprint(of: key2)
@@ -35,7 +35,7 @@ import CryptoKit
     let publicKeyData = Data("test public key data".utf8)
     let fingerprint = NexoFingerprintFormatter.fingerprint(of: publicKeyData)
     
-    // Debe contener solo caracteres hex válidos
+    // Must contain only valid hex characters
     let validHexChars = CharacterSet(charactersIn: "0123456789abcdef")
     let fingerprintChars = CharacterSet(charactersIn: fingerprint)
     
@@ -45,10 +45,10 @@ import CryptoKit
 // MARK: - TLS Configuration Tests
 
 @Test func tlsConfigurationCreation() throws {
-    // Este test verifica que la estructura de NexoTLSConfiguration se puede crear
-    // No podemos probar la funcionalidad real sin un sec_identity_t válido
+    // Verifies the NexoTLSConfiguration struct can be created.
+    // Real behavior can't be tested without a valid sec_identity_t.
     
-    // Verificamos que los tipos públicos existen y tienen la forma correcta
+    // Verifies the public types exist with the correct shape
     #expect(NexoTLSConfiguration.self is Any.Type)
 }
 
@@ -64,7 +64,7 @@ import CryptoKit
     ]
     
     for error in errors {
-        // Cada error debe tener una descripción no vacía
+        // Every error must have a non-empty description
         #expect(error.errorDescription?.isEmpty == false)
     }
 }

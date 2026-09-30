@@ -9,55 +9,55 @@ import OSLog
 
 // MARK: - NexoPeerVerificationState
 
-/// Estado de verificación de la identidad de un peer.
+/// Identity verification state for a peer.
 ///
-/// Nexo usa un modelo TOFU (Trust On First Use) similar a SSH:
-/// - La primera conexión almacena el fingerprint del peer
-/// - Conexiones subsiguientes verifican que el fingerprint coincide
-/// - Un cambio de fingerprint es una alerta de seguridad
+/// Nexo uses a TOFU (Trust On First Use) model similar to SSH:
+/// - First connection stores the peer's fingerprint
+/// - Subsequent connections verify the fingerprint matches
+/// - A fingerprint change is a security alert
 public enum NexoPeerVerificationState: String, Sendable, Equatable, CaseIterable {
-    /// El peer nunca se ha conectado antes. Su identidad no ha sido verificada.
+    /// The peer has never connected before. Its identity is unverified.
     case unknown
-    /// El peer se conectó por primera vez y el usuario aceptó su identidad.
-    /// La conexión está cifrada pero no hay garantía de que sea quien dice ser.
+    /// The peer connected for the first time and the user accepted its identity.
+    /// The connection is encrypted but there is no guarantee the peer is who it claims to be.
     case trustedOnFirstUse
-    /// El fingerprint del peer fue verificado fuera de banda (QR, comparación visual).
+    /// The peer's fingerprint was verified out of band (QR, visual comparison).
     case verified
-    /// El fingerprint del peer cambió desde la última conexión conocida.
-    /// Puede indicar un ataque MITM o que el peer reinstaló la app.
+    /// The peer's fingerprint changed since the last known connection.
+    /// This may indicate a MITM attack or that the peer reinstalled the app.
     case identityChanged
 }
 
 // MARK: - NexoPeerIdentityInfo
 
-/// Información de identidad de un peer para mostrar al usuario.
+/// Identity info for a peer, for display to the user.
 public struct NexoPeerIdentityInfo: Sendable, Equatable, Identifiable {
-    /// Application ID del peer.
+    /// The peer's Application ID.
     public let applicationID: String
-    /// Nombre mostrado del peer.
+    /// The peer's display name.
     public let displayName: String
-    /// Fingerprint SHA-256 del certificado público.
+    /// SHA-256 fingerprint of the public certificate.
     public let fingerprint: String
-    /// Estado de verificación.
+    /// Verification state.
     public let verificationState: NexoPeerVerificationState
-    /// Fecha de primera conexión (si está en trust store).
+    /// Date of first connection (if in the trust store).
     public let firstSeenAt: Date?
-    /// Fecha de última verificación exitosa.
+    /// Date of last successful verification.
     public let lastVerifiedAt: Date?
     
     public var id: String { applicationID }
     
-    /// Fingerprint formateado para mostrar (grupos de 4 caracteres).
+    /// Fingerprint formatted for display (groups of 4 characters).
     public var formattedFingerprint: String {
         NexoFingerprintFormatter.format(fingerprint)
     }
     
-    /// Fingerprint representado como emojis para comparación visual fácil.
+    /// Fingerprint rendered as emojis for easy visual comparison.
     public var emojiFingerprint: String {
         NexoFingerprintFormatter.toEmoji(fingerprint)
     }
     
-    /// Fingerprint representado como palabras para verificación por voz.
+    /// Fingerprint rendered as words for voice verification.
     public var wordFingerprint: String {
         NexoFingerprintFormatter.toWords(fingerprint)
     }
@@ -65,10 +65,10 @@ public struct NexoPeerIdentityInfo: Sendable, Equatable, Identifiable {
 
 // MARK: - NexoFingerprintFormatter
 
-/// Utilidades para formatear fingerprints de forma legible.
+/// Utilities for formatting fingerprints readably.
 public enum NexoFingerprintFormatter {
     
-    /// Formatea un fingerprint hex en grupos de 4 caracteres.
+    /// Formats a hex fingerprint in groups of 4 characters.
     public static func format(_ fingerprint: String, groupSize: Int = 4, separator: String = " ") -> String {
         var result = ""
         var count = 0
@@ -82,10 +82,10 @@ public enum NexoFingerprintFormatter {
         return result
     }
     
-    /// Convierte un fingerprint a una secuencia de emojis.
+    /// Converts a fingerprint to a sequence of emojis.
     ///
-    /// Cada par de caracteres hex (256 valores) se mapea a un emoji.
-    /// Esto hace la comparación visual más fácil y menos propensa a errores.
+    /// Each pair of hex characters (256 values) maps to one emoji, making
+    /// visual comparison easier and less error-prone.
     public static func toEmoji(_ fingerprint: String) -> String {
         let emojis: [Character] = [
             "🍎", "🍊", "🍋", "🍇", "🍓", "🫐", "🍑", "🍒",
@@ -102,7 +102,7 @@ public enum NexoFingerprintFormatter {
         let hex = fingerprint.lowercased()
         var index = hex.startIndex
         
-        // Tomamos los primeros 8 bytes (16 chars hex) para generar 8 emojis
+        // Take the first 8 bytes (16 hex chars) to generate 8 emojis
         for _ in 0..<8 {
             guard index < hex.endIndex else { break }
             let nextIndex = hex.index(index, offsetBy: 2, limitedBy: hex.endIndex) ?? hex.endIndex
@@ -119,10 +119,10 @@ public enum NexoFingerprintFormatter {
         return result
     }
     
-    /// Convierte un fingerprint a una frase de palabras.
+    /// Converts a fingerprint to a phrase of words.
     ///
-    /// Usa una lista de palabras cortas y distintivas, similar al sistema
-    /// de verificación de Signal/WhatsApp.
+    /// Uses a list of short, distinctive words, similar to the
+    /// Signal/WhatsApp verification system.
     public static func toWords(_ fingerprint: String) -> String {
         let words = [
             "alfa", "beta", "casa", "dado", "eco", "faro", "gato", "hora",
@@ -139,7 +139,7 @@ public enum NexoFingerprintFormatter {
         let hex = fingerprint.lowercased()
         var index = hex.startIndex
         
-        // Tomamos 6 bytes para generar 6 palabras
+        // Take 6 bytes to generate 6 words
         for _ in 0..<6 {
             guard index < hex.endIndex else { break }
             let nextIndex = hex.index(index, offsetBy: 2, limitedBy: hex.endIndex) ?? hex.endIndex
@@ -156,12 +156,12 @@ public enum NexoFingerprintFormatter {
         return result.joined(separator: " ")
     }
     
-    /// Compara dos fingerprints y devuelve si coinciden.
+    /// Compares two fingerprints and returns whether they match.
     public static func compare(_ a: String, _ b: String) -> Bool {
         a.lowercased() == b.lowercased()
     }
     
-    /// Genera el fingerprint SHA-256 de una clave pública.
+    /// Generates the SHA-256 fingerprint of a public key.
     public static func fingerprint(of publicKey: Data) -> String {
         SHA256.hash(data: publicKey)
             .map { String(format: "%02x", $0) }
@@ -171,15 +171,15 @@ public enum NexoFingerprintFormatter {
 
 // MARK: - NexoPeerVerificationService
 
-/// Servicio para gestionar la verificación de identidad de peers.
+/// Service that manages peer identity verification.
 ///
-/// Este servicio implementa TOFU (Trust On First Use):
-/// 1. Primera conexión: el fingerprint se almacena tras aceptación del usuario
-/// 2. Conexiones siguientes: se verifica que el fingerprint coincida
-/// 3. Cambio de fingerprint: se alerta al usuario (posible MITM)
+/// Implements TOFU (Trust On First Use):
+/// 1. First connection: the fingerprint is stored after user acceptance
+/// 2. Later connections: the fingerprint is verified to match
+/// 3. Fingerprint change: the user is alerted (possible MITM)
 ///
-/// Para mayor seguridad, los usuarios pueden verificar fingerprints fuera de banda
-/// (comparando emojis en persona, escaneando QR, etc.) y marcar el peer como "verificado".
+/// For stronger security, users can verify fingerprints out of band
+/// (comparing emojis in person, scanning a QR, etc.) and mark the peer as "verified".
 @MainActor
 @Observable
 public final class NexoPeerVerificationService {
@@ -188,10 +188,10 @@ public final class NexoPeerVerificationService {
     
     private let trustStore: NexoEnhancedTrustStore
     
-    /// Peers con identidad cambiada detectada (posible MITM).
+    /// Peers with a detected identity change (possible MITM).
     public private(set) var identityChangedPeers: Set<String> = []
     
-    /// Callback cuando se detecta un cambio de identidad.
+    /// Callback fired when an identity change is detected.
     public var onIdentityChanged: ((NexoPeerIdentityInfo, String) -> Void)?
     
     public init(applicationID: String) {
@@ -200,20 +200,20 @@ public final class NexoPeerVerificationService {
     
     // MARK: - Verification API
     
-    /// Verifica un peer conectado y retorna su estado de verificación.
+    /// Verifies a connected peer and returns its verification state.
     public func verify(_ peer: ConnectedPeer) -> NexoPeerVerificationState {
         guard let fingerprint = peer.certificateFingerprint else {
             return .unknown
         }
         
         guard let storedRecord = trustStore.record(for: peer.applicationID) else {
-            // Primera vez que vemos este peer
+            // First time seeing this peer
             return .unknown
         }
         
-        // Verificar que el fingerprint coincide
+        // Verify the fingerprint matches the stored record
         guard NexoFingerprintFormatter.compare(fingerprint, storedRecord.fingerprint) else {
-            // ¡Alerta! El fingerprint cambió
+            // Alert: fingerprint changed
             Self.logger.warning("Identity changed for peer \(peer.applicationID): expected \(storedRecord.fingerprint.prefix(16))..., got \(fingerprint.prefix(16))...")
             identityChangedPeers.insert(peer.applicationID)
             
@@ -223,14 +223,13 @@ public final class NexoPeerVerificationService {
             return .identityChanged
         }
         
-        // El fingerprint coincide
         identityChangedPeers.remove(peer.applicationID)
         trustStore.updateLastSeen(for: peer.applicationID)
         
         return storedRecord.isVerified ? .verified : .trustedOnFirstUse
     }
     
-    /// Confía en un peer por primera vez (TOFU).
+    /// Trusts a peer for the first time (TOFU).
     @discardableResult
     public func trustOnFirstUse(_ peer: ConnectedPeer) -> Bool {
         guard let fingerprint = peer.certificateFingerprint else {
@@ -246,16 +245,16 @@ public final class NexoPeerVerificationService {
         )
     }
     
-    /// Marca un peer como verificado (el usuario confirmó el fingerprint fuera de banda).
+    /// Marks a peer as verified (the user confirmed the fingerprint out of band).
     @discardableResult
     public func markAsVerified(_ peer: ConnectedPeer) -> Bool {
         guard peer.certificateFingerprint != nil else { return false }
         return trustStore.markAsVerified(peer.applicationID)
     }
     
-    /// Acepta un cambio de identidad (el usuario confirmó que es legítimo).
+    /// Accepts an identity change (the user confirmed it is legitimate).
     ///
-    /// Esto reemplaza el fingerprint almacenado. Usar con precaución.
+    /// This replaces the stored fingerprint. Use with caution.
     @discardableResult
     public func acceptIdentityChange(_ peer: ConnectedPeer) -> Bool {
         guard let fingerprint = peer.certificateFingerprint else { return false }
@@ -263,7 +262,6 @@ public final class NexoPeerVerificationService {
         Self.logger.info("User accepted identity change for \(peer.applicationID)")
         identityChangedPeers.remove(peer.applicationID)
         
-        // Eliminar el registro antiguo y crear uno nuevo
         trustStore.revoke(peer.applicationID)
         return trustStore.trust(
             applicationID: peer.applicationID,
@@ -273,13 +271,13 @@ public final class NexoPeerVerificationService {
         )
     }
     
-    /// Revoca la confianza en un peer.
+    /// Revokes trust in a peer.
     public func revoke(_ applicationID: String) {
         trustStore.revoke(applicationID)
         identityChangedPeers.remove(applicationID)
     }
     
-    /// Obtiene información de identidad para mostrar al usuario.
+    /// Returns identity info for display to the user.
     public func identityInfo(for peer: ConnectedPeer, state: NexoPeerVerificationState? = nil) -> NexoPeerIdentityInfo {
         let actualState = state ?? verify(peer)
         let record = trustStore.record(for: peer.applicationID)
@@ -294,12 +292,12 @@ public final class NexoPeerVerificationService {
         )
     }
     
-    /// Lista todos los peers confiados.
+    /// Lists all trusted peers.
     public func trustedPeers() -> [NexoTrustRecord] {
         trustStore.allRecords()
     }
     
-    /// Verifica si un peer está confiado.
+    /// Checks whether a peer is trusted.
     public func isTrusted(_ applicationID: String) -> Bool {
         trustStore.record(for: applicationID) != nil
     }
@@ -307,7 +305,7 @@ public final class NexoPeerVerificationService {
 
 // MARK: - NexoTrustRecord
 
-/// Registro de confianza almacenado para un peer.
+/// Trust record stored for a peer.
 public struct NexoTrustRecord: Codable, Sendable, Identifiable {
     public let applicationID: String
     public let displayName: String
@@ -322,7 +320,7 @@ public struct NexoTrustRecord: Codable, Sendable, Identifiable {
 
 // MARK: - NexoEnhancedTrustStore
 
-/// Almacén mejorado de peers confiados con metadatos adicionales.
+/// Enhanced store of trusted peers with additional metadata.
 @MainActor
 public final class NexoEnhancedTrustStore {
     
@@ -440,7 +438,7 @@ public final class NexoEnhancedTrustStore {
 
 // MARK: - QR Code Generation for Verification
 
-/// Datos para generar un código QR de verificación.
+/// Data for generating a verification QR code.
 public struct NexoVerificationQRData: Codable, Sendable {
     public let applicationID: String
     public let displayName: String
@@ -454,17 +452,17 @@ public struct NexoVerificationQRData: Codable, Sendable {
         self.timestamp = Date()
     }
     
-    /// Codifica los datos para un código QR.
+    /// Encodes the data for a QR code.
     public func encode() -> Data? {
         try? JSONEncoder().encode(self)
     }
     
-    /// Decodifica datos de un código QR escaneado.
+    /// Decodes data from a scanned QR code.
     public static func decode(_ data: Data) -> NexoVerificationQRData? {
         try? JSONDecoder().decode(NexoVerificationQRData.self, from: data)
     }
     
-    /// Verifica si los datos del QR coinciden con un peer conectado.
+    /// Checks whether the QR data matches a connected peer.
     public func matches(_ peer: ConnectedPeer) -> Bool {
         guard let peerFingerprint = peer.certificateFingerprint else { return false }
         return applicationID == peer.applicationID
