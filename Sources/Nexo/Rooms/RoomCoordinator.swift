@@ -88,8 +88,20 @@ public final class RoomCoordinator {
     }
 
     /// Descriptors published in the Bonjour advertisement.
+    ///
+    /// A room created from chat has no declared kind, so the game it is playing
+    /// right now is advertised instead: that is what puts it in the game's list
+    /// of nearby rooms. Derived here rather than stored, because writing it back
+    /// into the descriptor would leave the kind behind when the activity ends.
     public var advertisedRoomDescriptors: [RoomDescriptor] {
-        hostedRooms.map(\.descriptor)
+        hostedRooms.map { session in
+            guard session.descriptor.activityKind == nil,
+                  let liveKind = session.liveActivityKind else { return session.descriptor }
+
+            var descriptor = session.descriptor
+            descriptor.activityKind = liveKind
+            return descriptor
+        }
     }
 
     /// Discovered rooms ready to display, in a stable order.
@@ -418,6 +430,10 @@ public final class RoomCoordinator {
 
         session.register(activity)
 
+        // A room that didn't declare a kind starts advertising the one it is
+        // playing, so it shows up in that game's list of nearby rooms.
+        republishIfHosting(session)
+
         let message: RoomControlMessage
         switch announcement {
         case .started:
@@ -467,6 +483,9 @@ public final class RoomCoordinator {
         }
 
         session.removeActivity(activityID, reason: reason)
+
+        // The room survives the activity, so the advertised kind goes with it.
+        republishIfHosting(session)
     }
 }
 
@@ -816,6 +835,7 @@ private extension RoomCoordinator {
         case .activityJoinRejected(let payload):
             guard let session = sessions[payload.roomID] else { return }
             session.removeActivity(payload.activityID, reason: payload.reason)
+            republishIfHosting(session)
 
         case .activityLeft(let payload):
             guard let session = sessions[payload.roomID],
@@ -828,6 +848,7 @@ private extension RoomCoordinator {
                   let activity = session.activity(payload.activityID),
                   activity.isHost(peer.applicationID) else { return }
             session.removeActivity(payload.activityID, reason: payload.reason)
+            republishIfHosting(session)
         }
     }
 
@@ -1084,6 +1105,9 @@ private extension RoomCoordinator {
                 reason: "La actividad ya no está activa."
             )
         }
+        if !staleActivities.isEmpty {
+            republishIfHosting(session)
+        }
 
         for descriptor in activeDescriptors {
             instantiateActivity(descriptor, in: session)
@@ -1247,9 +1271,19 @@ private extension RoomCoordinator {
             activity.apply(descriptor: descriptor)
             activity.participantDidJoin(member)
 
+            // The newcomer asked to enter the room, so for them this is an
+            // admission rather than an invitation: `.activityStarted` would make
+            // their UI announce a game they just walked into.
+            send(
+                .activityJoinAccepted(ActivityLifecyclePayload(descriptor: descriptor)),
+                to: [applicationID],
+                roomID: session.roomID
+            )
             send(
                 .activityStarted(ActivityLifecyclePayload(descriptor: descriptor)),
-                to: descriptor.participantIDs.filter { $0 != identity.applicationID }.sorted(),
+                to: descriptor.participantIDs
+                    .filter { $0 != identity.applicationID && $0 != applicationID }
+                    .sorted(),
                 roomID: session.roomID
             )
         }
@@ -1412,6 +1446,7 @@ private extension RoomCoordinator {
         guard let activity = registry.makeActivity(for: session.makeActivityContext(for: descriptor))
         else { return }
         session.register(activity)
+        republishIfHosting(session)
     }
 }
 
@@ -1615,6 +1650,13 @@ private extension RoomCoordinator {
             rooms: advertisedRoomDescriptors,
             totalRoomCount: hostedRooms.count
         ))
+    }
+
+    /// Republishes after the set of live activities changed in a room we host:
+    /// the advertised kind is derived from it. Guests advertise nothing of it.
+    func republishIfHosting(_ session: RoomSession) {
+        guard session.isLocalHost else { return }
+        publishAdvertisement()
     }
 
     func send(_ message: RoomControlMessage, to applicationIDs: [String], roomID: RoomID) {

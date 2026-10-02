@@ -87,6 +87,42 @@ public final class NetworkPeerTransport: PeerTransport {
         }
     }
 
+    // MARK: - RetryGate
+
+    /// Bounded backoff for the pieces of the Bonjour stack.
+    ///
+    /// A listener or browser that fails is never rebuilt by Network on its own,
+    /// and without this the failure is permanent: `start` with unchanged flags
+    /// is a no-op. The budget is finite so a genuinely broken radio stops being
+    /// hammered instead of retrying until the app is killed.
+    @MainActor
+    fileprivate final class RetryGate {
+        private static let delays: [Duration] = [.seconds(2), .seconds(5), .seconds(10)]
+
+        private var attempt = 0
+        private var task: Task<Void, Never>?
+
+        func reset() {
+            attempt = 0
+            task?.cancel()
+            task = nil
+        }
+
+        /// Queues `body` after the next backoff step, if any is left.
+        func schedule(_ body: @escaping @MainActor () -> Void) {
+            guard attempt < Self.delays.count else { return }
+            let delay = Self.delays[attempt]
+            attempt += 1
+
+            task?.cancel()
+            task = Task { @MainActor in
+                try? await Task.sleep(for: delay)
+                guard !Task.isCancelled else { return }
+                body()
+            }
+        }
+    }
+
     // MARK: - Identity and advertisement
 
     private let applicationID: String
@@ -119,6 +155,11 @@ public final class NetworkPeerTransport: PeerTransport {
     private var quicListenerTask: Task<Void, Never>?
     private var browserTask: Task<Void, Never>?
     private var quicBrowserTask: Task<Void, Never>?
+
+    private let listenerRetry = RetryGate()
+    private let quicListenerRetry = RetryGate()
+    private let browserRetry = RetryGate()
+    private let quicBrowserRetry = RetryGate()
 
     // MARK: - Events
 
@@ -208,23 +249,46 @@ public final class NetworkPeerTransport: PeerTransport {
     public func start(advertising: Bool, browsing: Bool) {
         let advertisingChanged = isAdvertising != advertising
         let browsingChanged = isBrowsing != browsing
-        guard advertisingChanged || browsingChanged else { return }
+
+        // A missing task means the previous attempt failed and gave up. The
+        // flags didn't change, but rebuilding is the only way back.
+        let needsListener = advertising && (listenerTask == nil || quicListenerTask == nil)
+        let needsBrowser = browsing && (browserTask == nil || quicBrowserTask == nil)
+
+        guard advertisingChanged || browsingChanged || needsListener || needsBrowser else { return }
 
         epoch &+= 1
         isAdvertising = advertising
         isBrowsing = browsing
         updateLocalNetworkPermission(.unknown)
+        resetRetryBudget()
 
-        if advertisingChanged {
+        if advertisingChanged || needsListener {
             syncListener()
             syncQUICListener()
         }
-        if browsingChanged {
+        if browsingChanged || needsBrowser {
             syncBrowser()
             syncQUICBrowser()
         }
 
         emit(.lifecycleChanged(.active, epoch: epoch))
+    }
+
+    public func refreshDiscovery() {
+        resetRetryBudget()
+
+        if isAdvertising {
+            // Only rebuild what died: a healthy listener keeps accepting
+            // connections and re-creating it would interrupt them.
+            if listenerTask == nil { syncListener(isRecovery: true) }
+            if quicListenerTask == nil { syncQUICListener() }
+            republishTXTRecord()
+        }
+
+        guard isBrowsing else { return }
+        syncBrowser()
+        syncQUICBrowser()
     }
 
     public func stop() {
@@ -237,6 +301,7 @@ public final class NetworkPeerTransport: PeerTransport {
         isAdvertising = false
         isBrowsing = false
 
+        resetRetryBudget()
         listenerTask?.cancel()
         listenerTask = nil
         listener = nil
@@ -289,18 +354,36 @@ public final class NetworkPeerTransport: PeerTransport {
         guard record != advertisement else { return }
         advertisement = record
 
-        guard isAdvertising, let listener else { return }
+        guard isAdvertising else { return }
 
-        // The TXT record can be swapped live: the remote browser sees the
-        // change without the service restarting or connections dropping.
-        var service = listener.service
-        service?.txtRecordObject = NWTXTRecord(record.txtDictionary)
-        listener.service = service
+        // A missing listener means an earlier attempt failed. Rebuild it: the
+        // equality guard above would otherwise block every retry of this record
+        // and the rooms would never be published.
+        if listenerTask == nil { syncListener(isRecovery: true) }
+        if quicListenerTask == nil { syncQUICListener() }
+
+        republishTXTRecord()
+    }
+
+    /// Writes the current advertisement into both services.
+    ///
+    /// The TXT record can be swapped live: the remote browser sees the change
+    /// without the service restarting or connections dropping. Unconditional,
+    /// unlike `updateAdvertisement`, so a swap that was dropped while a
+    /// listener was down can be re-applied.
+    private func republishTXTRecord() {
+        let record = NWTXTRecord(advertisement.txtDictionary)
+
+        if let listener {
+            var service = listener.service
+            service?.txtRecordObject = record
+            listener.service = service
+        }
 
         if let quicListener {
-            var quicService = quicListener.service
-            quicService?.txtRecordObject = NWTXTRecord(record.txtDictionary)
-            quicListener.service = quicService
+            var service = quicListener.service
+            service?.txtRecordObject = record
+            quicListener.service = service
         }
 
         // The display name travels in TXT, so a rename doesn't force
@@ -467,6 +550,7 @@ private extension NetworkPeerTransport {
 
         quicListenerTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            guard !Task.isCancelled else { return }
 
             do {
                 let listener = try QUICListener(
@@ -479,6 +563,7 @@ private extension NetworkPeerTransport {
                     using: self.makeQUICParameters()
                 )
                 self.quicListener = listener
+                self.quicListenerRetry.reset()
 
                 try await listener.run { [weak self] connection in
                     guard let self else { return }
@@ -489,11 +574,21 @@ private extension NetworkPeerTransport {
             } catch {
                 Self.logger.error("QUIC listener failed: \(error.localizedDescription, privacy: .public)")
                 self.quicListener = nil
+                self.quicListenerTask = nil
+                guard !self.isLocalNetworkPermissionDenied(error) else { return }
+                self.scheduleRetry(self.quicListenerRetry, epochAtFailure: self.epoch, isStillBroken: { self.quicListenerTask == nil }) {
+                    self.syncQUICListener()
+                }
             }
         }
     }
 
-    func syncListener() {
+    /// Builds the control-channel listener.
+    ///
+    /// `isRecovery` marks a rebuild after a failure: the listener reports
+    /// `.active` again so whoever saw the `.disconnected` stops treating the
+    /// transport as dead. The first build doesn't: `start` already emits it.
+    func syncListener(isRecovery: Bool = false) {
         listenerTask?.cancel()
         listenerTask = nil
         listener = nil
@@ -502,6 +597,9 @@ private extension NetworkPeerTransport {
 
         listenerTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            // `stop` cancels the task but can't stop a body that hasn't started:
+            // without this a listener is registered after the transport is down.
+            guard !Task.isCancelled else { return }
 
             do {
                 let listener = try Listener(
@@ -514,6 +612,10 @@ private extension NetworkPeerTransport {
                     using: self.makeParameters()
                 )
                 self.listener = listener
+                self.listenerRetry.reset()
+                if isRecovery {
+                    self.emit(.lifecycleChanged(.active, epoch: self.epoch))
+                }
 
                 try await listener.run { [weak self] connection in
                     guard let self else { return }
@@ -524,8 +626,13 @@ private extension NetworkPeerTransport {
             } catch {
                 Self.logger.error("TCP listener failed: \(error.localizedDescription, privacy: .public)")
                 self.listener = nil
+                self.listenerTask = nil
                 if self.isLocalNetworkPermissionDenied(error) {
                     self.updateLocalNetworkPermission(.denied)
+                } else {
+                    self.scheduleRetry(self.listenerRetry, epochAtFailure: self.epoch, isStillBroken: { self.listenerTask == nil }) {
+                        self.syncListener(isRecovery: true)
+                    }
                 }
                 self.emit(.lifecycleChanged(.disconnected, epoch: self.epoch))
             }
@@ -543,6 +650,7 @@ private extension NetworkPeerTransport {
 
         browserTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            guard !Task.isCancelled else { return }
 
             // `includeTxtRecord: true` is mandatory: without it the TXT
             // record arrives empty and rooms can't be listed before connecting.
@@ -557,6 +665,7 @@ private extension NetworkPeerTransport {
 
             do {
                 try await browser.run { [weak self] endpoints in
+                    self?.browserRetry.reset()
                     self?.updateLocalNetworkPermission(.available)
                     self?.updateAdvertisements(endpoints)
                 }
@@ -564,9 +673,14 @@ private extension NetworkPeerTransport {
                 return
             } catch {
                 Self.logger.error("TCP browser failed: \(error.localizedDescription, privacy: .public)")
+                self.browserTask = nil
                 self.clearAdvertisements()
                 if self.isLocalNetworkPermissionDenied(error) {
                     self.updateLocalNetworkPermission(.denied)
+                } else {
+                    self.scheduleRetry(self.browserRetry, epochAtFailure: self.epoch, isStillBroken: { self.browserTask == nil }) {
+                        self.syncBrowser()
+                    }
                 }
             }
         }
@@ -583,6 +697,7 @@ private extension NetworkPeerTransport {
 
         quicBrowserTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            guard !Task.isCancelled else { return }
 
             let browser = NetworkBrowser(
                 for: .bonjour(
@@ -595,15 +710,45 @@ private extension NetworkPeerTransport {
 
             do {
                 try await browser.run { [weak self] endpoints in
+                    self?.quicBrowserRetry.reset()
                     self?.updateQUICEndpoints(endpoints)
                 }
             } catch is CancellationError {
                 return
             } catch {
                 Self.logger.error("QUIC browser failed: \(error.localizedDescription, privacy: .public)")
+                self.quicBrowserTask = nil
                 self.quicEndpointsByApplicationID.removeAll()
+                guard !self.isLocalNetworkPermissionDenied(error) else { return }
+                self.scheduleRetry(self.quicBrowserRetry, epochAtFailure: self.epoch, isStillBroken: { self.quicBrowserTask == nil }) {
+                    self.syncQUICBrowser()
+                }
             }
         }
+    }
+
+    /// Backs off a failed piece of the Bonjour stack.
+    ///
+    /// The epoch guard drops the retry if the transport was stopped and
+    /// restarted in between; `isStillBroken` drops it if something else
+    /// already rebuilt the piece.
+    func scheduleRetry(
+        _ gate: RetryGate,
+        epochAtFailure: UInt64,
+        isStillBroken: @escaping @MainActor () -> Bool,
+        rebuild: @escaping @MainActor () -> Void
+    ) {
+        gate.schedule { [weak self] in
+            guard let self, self.epoch == epochAtFailure, isStillBroken() else { return }
+            rebuild()
+        }
+    }
+
+    func resetRetryBudget() {
+        listenerRetry.reset()
+        quicListenerRetry.reset()
+        browserRetry.reset()
+        quicBrowserRetry.reset()
     }
 
     func updateLocalNetworkPermission(_ state: LocalNetworkPermissionState) {

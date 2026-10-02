@@ -34,6 +34,13 @@ public protocol PeerTransport: AnyObject {
     /// switching rooms never drops open connections.
     func updateAdvertisement(_ record: AdvertisementRecord)
 
+    /// Re-runs discovery: rebuilds any listener that died and restarts the
+    /// browsers. A fresh Bonjour query always returns the peers' current TXT,
+    /// which is the only way to heal a missed advertisement update.
+    ///
+    /// Established connections survive it.
+    func refreshDiscovery()
+
     // MARK: Connections
 
     /// Opens a connection to the given advertisement, or reuses an existing

@@ -62,6 +62,14 @@ public final class RoomSession: Identifiable {
             ?? activities.values.first { $0.descriptor.isExclusive }
     }
 
+    /// Kind of the game being played right now, for a room that didn't declare
+    /// one. Ordered so the advertised value doesn't depend on dictionary order.
+    public var liveActivityKind: ActivityKind? {
+        activities.values
+            .map(\.descriptor.kind)
+            .min { $0.rawValue < $1.rawValue }
+    }
+
     public var canStartActivity: Bool {
         features.hasActivities
             && activities.values.allSatisfy { !$0.descriptor.isActive || !$0.descriptor.isExclusive }
