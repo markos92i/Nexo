@@ -60,7 +60,9 @@ public struct ActivityDescriptor: Codable, Hashable, Sendable, Identifiable {
     public let roomID: RoomID
     public let kind: ActivityKind
     /// Authority for this activity. May differ from the room's host.
-    public let hostApplicationID: String
+    public var hostApplicationID: String
+    /// Increased whenever activity authority moves to another participant.
+    public var hostGeneration: UInt64
     public var participantIDs: Set<String>
     public var state: ActivityState
     /// `true` if open to the whole room, so members who join later are
@@ -78,6 +80,7 @@ public struct ActivityDescriptor: Codable, Hashable, Sendable, Identifiable {
         kind: ActivityKind,
         hostApplicationID: String,
         participantIDs: Set<String>,
+        hostGeneration: UInt64 = 0,
         state: ActivityState = .lobby,
         admitsRoomMembers: Bool = true,
         isExclusive: Bool = true
@@ -86,6 +89,7 @@ public struct ActivityDescriptor: Codable, Hashable, Sendable, Identifiable {
         self.roomID = roomID
         self.kind = kind
         self.hostApplicationID = hostApplicationID
+        self.hostGeneration = hostGeneration
         self.participantIDs = participantIDs
         self.state = state
         self.admitsRoomMembers = admitsRoomMembers
@@ -99,6 +103,7 @@ public struct ActivityDescriptor: Codable, Hashable, Sendable, Identifiable {
         roomID = try container.decode(RoomID.self, forKey: .roomID)
         kind = try container.decode(ActivityKind.self, forKey: .kind)
         hostApplicationID = try container.decode(String.self, forKey: .hostApplicationID)
+        hostGeneration = try container.decodeIfPresent(UInt64.self, forKey: .hostGeneration) ?? 0
         participantIDs = try container.decode(Set<String>.self, forKey: .participantIDs)
         state = try container.decode(ActivityState.self, forKey: .state)
         admitsRoomMembers = try container.decodeIfPresent(Bool.self, forKey: .admitsRoomMembers) ?? true

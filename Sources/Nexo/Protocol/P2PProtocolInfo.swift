@@ -11,10 +11,10 @@ import Foundation
 /// framework. Negotiated during the handshake, before any envelope is admitted.
 public enum P2PProtocolInfo {
 
-    /// Room resume is part of this version's wire format, so it is not
+    /// Host migration is part of this version's wire format, so it is not
     /// advertised as compatible with older peers.
-    public static let currentVersion: UInt8 = 3
-    public static let minimumVersion: UInt8 = 3
+    public static let currentVersion: UInt8 = 4
+    public static let minimumVersion: UInt8 = 4
 
     /// Capabilities advertised in `hello`. Lets new features roll out without
     /// breaking older peers: unsupported capabilities are simply not used with them.
@@ -66,6 +66,9 @@ public enum P2PLimits {
     /// checked on foreground return, since iOS may suspend execution without
     /// guaranteeing a timer advances.
     public static let temporaryDisconnectGracePeriod: TimeInterval = 60
+    /// Fail over sooner than the reconnect grace period so a dead host does
+    /// not freeze an otherwise connected mesh for a full minute.
+    public static let hostMigrationDelay: Duration = .seconds(5)
 
     /// Retention window for the chat/activity journal used to replay messages
     /// after a physical reconnection.

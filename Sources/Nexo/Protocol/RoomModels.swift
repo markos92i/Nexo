@@ -117,7 +117,9 @@ public struct RoomDescriptor: Codable, Hashable, Sendable, Identifiable {
     public let id: RoomID
     public var name: String
     /// Application identity of the host that created and governs it.
-    public let hostApplicationID: String
+    public var hostApplicationID: String
+    /// Increased whenever authority moves to another room member.
+    public var hostGeneration: UInt64
     public var features: RoomFeatures
     /// Primary intended activity. A game room declares this so discovery can
     /// filter by game without connecting.
@@ -137,17 +139,38 @@ public struct RoomDescriptor: Codable, Hashable, Sendable, Identifiable {
         accessPolicy: RoomAccessPolicy = .open,
         memberCount: Int = 1,
         capacity: Int? = nil,
+        hostGeneration: UInt64 = 0,
         protocolVersion: UInt8 = P2PProtocolInfo.currentVersion
     ) {
         self.id = id
         self.name = name
         self.hostApplicationID = hostApplicationID
+        self.hostGeneration = hostGeneration
         self.features = features
         self.activityKind = activityKind
         self.accessPolicy = accessPolicy
         self.memberCount = memberCount
         self.capacity = capacity
         self.protocolVersion = protocolVersion
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, hostApplicationID, hostGeneration, features, activityKind
+        case accessPolicy, memberCount, capacity, protocolVersion
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(RoomID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        hostApplicationID = try container.decode(String.self, forKey: .hostApplicationID)
+        hostGeneration = try container.decodeIfPresent(UInt64.self, forKey: .hostGeneration) ?? 0
+        features = try container.decode(RoomFeatures.self, forKey: .features)
+        activityKind = try container.decodeIfPresent(ActivityKind.self, forKey: .activityKind)
+        accessPolicy = try container.decode(RoomAccessPolicy.self, forKey: .accessPolicy)
+        memberCount = try container.decode(Int.self, forKey: .memberCount)
+        capacity = try container.decodeIfPresent(Int.self, forKey: .capacity)
+        protocolVersion = try container.decode(UInt8.self, forKey: .protocolVersion)
     }
 
     public var isFull: Bool {

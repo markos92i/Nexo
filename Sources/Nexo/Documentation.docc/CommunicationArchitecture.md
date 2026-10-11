@@ -197,7 +197,22 @@ P2PLimits.recoveryChatMessageLimit = 100
 Al reconectar:
 1. El host reenvía membresía actual
 2. El host reenvía historial de chat reciente
-3. Las actividades reinician desde su último estado conocido
+3. Las actividades recuperan sus descriptores y sincronizan el estado propio de cada juego
+
+## Traspaso de anfitrión
+
+Si el anfitrión desaparece pero quedan miembros conectados entre sí, la sala
+elige al siguiente miembro disponible según el orden estable de la lista de
+miembros. El traspaso se anuncia con una nueva generación de autoridad; así,
+los mensajes tardíos de un anfitrión anterior no sustituyen la autoridad actual.
+La migración comienza tras cinco segundos y la ventana de reconexión temporal
+de sesenta segundos sigue permitiendo reconciliar a quien vuelva después.
+
+La elección es de mejor esfuerzo, no un consenso con quórum: una partición de
+red puede dar a dos grupos una vista distinta de qué miembros están disponibles.
+Los juegos que tienen estado autoritativo deben distribuir checkpoints
+restaurables; el sucesor reanuda desde el último checkpoint recibido. La sala,
+el historial de chat y la autoridad de actividad se transfieren por separado.
 
 ## Límites de Protocolo
 

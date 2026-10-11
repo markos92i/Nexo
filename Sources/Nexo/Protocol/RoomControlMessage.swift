@@ -30,6 +30,8 @@ public enum RoomControlMessage: Codable, Sendable {
     case roomMembershipChanged(RoomMembershipPayload)
     /// Authoritative snapshot sent by the host when a connection is restored.
     case roomResume(RoomResumePayload)
+    /// New room authority elected after the previous host became unreachable.
+    case roomHostChanged(RoomHostChangedPayload)
     /// Chat history, sent in chunks to complete the short resume snapshot.
     case chatHistory(ChatHistoryPayload)
     case roomClosed(RoomClosedPayload)
@@ -95,6 +97,30 @@ public struct RoomResumePayload: Codable, Sendable {
     public let members: [RoomMember]
     public let activities: [ActivityDescriptor]
     public let chatMessages: [ChatMessage]
+}
+
+public struct RoomHostChangedPayload: Codable, Sendable {
+    public let failedHostApplicationID: String
+    /// Members between the failed host and elected host that were unavailable
+    /// to the elected peer when it made the choice.
+    public let skippedApplicationIDs: [String]
+    public let descriptor: RoomDescriptor
+    public let members: [RoomMember]
+    public let activities: [ActivityDescriptor]
+
+    public init(
+        failedHostApplicationID: String,
+        skippedApplicationIDs: [String],
+        descriptor: RoomDescriptor,
+        members: [RoomMember],
+        activities: [ActivityDescriptor]
+    ) {
+        self.failedHostApplicationID = failedHostApplicationID
+        self.skippedApplicationIDs = skippedApplicationIDs
+        self.descriptor = descriptor
+        self.members = members
+        self.activities = activities
+    }
 }
 
 /// A chunk of chat history. `roomID` is deliberately repeated inside the
