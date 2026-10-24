@@ -49,8 +49,8 @@ public struct PeerAdvertisement: Identifiable, Sendable, Equatable {
 public struct ConnectedPeer: Identifiable, Sendable, Hashable {
     public let applicationID: String
     public let displayName: String
-    /// SHA-256 fingerprint of the peer's certificate public key, exchanged
-    /// over the already encrypted control channel.
+    /// SHA-256 of the negotiated TLS leaf public key, not a JSON assertion.
+    /// Binding an application ID to this key still requires TOFU or out-of-band trust.
     public let certificateFingerprint: String?
     public let protocolVersion: UInt8
     public let capabilities: Set<P2PCapability>
@@ -97,44 +97,33 @@ public enum PeerTransportEvent: Sendable {
     case advertisementUpdated(PeerAdvertisement, epoch: UInt64)
     case advertisementLost(TransportPeerID, epoch: UInt64)
     case peerConnected(ConnectedPeer, epoch: UInt64)
-    case peerDisconnected(applicationID: String, reason: String?, epoch: UInt64)
+    case peerDisconnected(applicationID: String, reason: NexoReason?, epoch: UInt64)
     case received(RoomEnvelope, from: ConnectedPeer, epoch: UInt64)
     case lifecycleChanged(ConnectivityLifecycle, epoch: UInt64)
     case localNetworkPermissionChanged(LocalNetworkPermissionState, epoch: UInt64)
+
+    public var epoch: UInt64 {
+        switch self {
+        case .advertisementFound(_, let epoch), .advertisementUpdated(_, let epoch),
+             .advertisementLost(_, let epoch), .peerConnected(_, let epoch),
+             .peerDisconnected(_, _, let epoch), .received(_, _, let epoch),
+             .lifecycleChanged(_, let epoch), .localNetworkPermissionChanged(_, let epoch):
+            epoch
+        }
+    }
 }
 
 // MARK: - P2PTransportError
 
-public enum P2PTransportError: Error, LocalizedError, Sendable, Equatable {
+public enum P2PTransportError: Error, Codable, Sendable, Equatable {
     case peerNotDiscovered
     case notConnected
     case handshakeTimedOut
-    case handshakeFailed(String)
+    case handshakeFailed(NexoReason)
     case incompatibleProtocol(UInt8)
     case envelopeTooLarge(Int)
     case transportStopped
-    case connectionFailed(String)
-
-    public var errorDescription: String? {
-        switch self {
-        case .peerNotDiscovered:
-            "El dispositivo ya no está visible en la red local."
-        case .notConnected:
-            "No hay conexión activa con el dispositivo."
-        case .handshakeTimedOut:
-            "El dispositivo no completó la conexión a tiempo."
-        case .handshakeFailed(let reason):
-            reason
-        case .incompatibleProtocol(let version):
-            "La versión del protocolo del otro dispositivo (\(version)) no es compatible."
-        case .envelopeTooLarge(let bytes):
-            "El mensaje ocupa \(bytes) bytes y supera el límite permitido."
-        case .transportStopped:
-            "La conectividad se ha detenido."
-        case .connectionFailed(let reason):
-            reason
-        }
-    }
+    case connectionFailed(NexoReason)
 }
 
 // MARK: - AdvertisementRecord
@@ -216,9 +205,7 @@ public struct AdvertisementRecord: Sendable, Equatable {
         fallbackName: String
     ) -> PeerAdvertisement {
         let version = txt[Key.version].flatMap { UInt8($0) } ?? 0
-        let displayName = txt[Key.displayName]?.isEmpty == false
-            ? txt[Key.displayName]!
-            : fallbackName
+        let displayName = txt[Key.displayName] ?? fallbackName
 
         var rooms: [RoomDescriptor] = []
         for index in 0..<P2PLimits.advertisedRoomLimit {

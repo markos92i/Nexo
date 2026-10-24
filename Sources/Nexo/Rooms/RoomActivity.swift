@@ -12,7 +12,7 @@ import Foundation
 /// The transport and `RoomCoordinator` treat its payload as opaque: each
 /// activity defines and decodes its own messages. Adding a new game never
 /// touches a lower layer.
-@MainActor
+@NexoActor
 public protocol RoomActivity: AnyObject {
 
     var descriptor: ActivityDescriptor { get }
@@ -26,10 +26,14 @@ public protocol RoomActivity: AnyObject {
 
     /// The activity ends. Only the activity is destroyed; the room and its
     /// other activities stay alive.
-    func activityDidEnd(reason: String)
+    func activityDidEnd(reason: NexoReason)
 
     /// Applies an updated descriptor received from the host.
     func apply(descriptor: ActivityDescriptor)
+
+    /// Called whenever the descriptor changes, so the room that owns the
+    /// activity can republish its snapshot.
+    var onDescriptorChange: (@NexoActor () -> Void)? { get set }
 }
 
 public extension RoomActivity {
@@ -51,7 +55,10 @@ public struct ActivityContext {
     /// The room's sender. The activity always sends with its own `activityID`.
     public let outbox: RoomOutbox
     /// Live room members, resolved on every query.
-    public let members: @MainActor () -> [RoomMember]
+    public let members: @NexoActor () -> [RoomMember]
+    /// Ends this activity through its owning room, removing it from the
+    /// session and notifying its participants. `nil` when no room owns it.
+    public let endActivity: (@NexoActor (NexoReason) -> Void)?
 
     /// `true` if the local user is authoritative for this activity.
     public var isLocalHost: Bool {
@@ -60,7 +67,7 @@ public struct ActivityContext {
 
     /// Activity participants excluding the local user. `descriptor` is passed
     /// in because it can change as new members join an open activity.
-    @MainActor
+    @NexoActor
     public func participants(for descriptor: ActivityDescriptor) -> [RoomMember] {
         members().filter {
             descriptor.includes($0.applicationID) && $0.applicationID != identity.applicationID
@@ -75,16 +82,14 @@ public struct ActivityContext {
 /// This is the extension point for future games: register a factory at
 /// launch, and `RoomCoordinator` can instantiate the right activity on
 /// `activityStarted` without knowing about any concrete game.
-@MainActor
+@NexoActor
 public final class RoomActivityRegistry {
 
-    public typealias Factory = @MainActor (ActivityContext) -> any RoomActivity
-
-    public static let shared = RoomActivityRegistry()
+    public typealias Factory = @NexoActor (ActivityContext) -> any RoomActivity
 
     private var factories: [ActivityKind: Factory] = [:]
 
-    private init() {}
+    public init() {}
 
     // MARK: - Public API
 

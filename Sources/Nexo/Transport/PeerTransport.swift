@@ -12,14 +12,30 @@ import Foundation
 /// The transport doesn't know what a room is: it only discovers devices,
 /// keeps one connection per peer, and delivers opaque envelopes. All logical
 /// routing lives in `RoomCoordinator`.
-@MainActor
-public protocol PeerTransport: AnyObject {
+///
+/// Nothing here is tied to the main actor. Bonjour churn, TXT decoding,
+/// connection bookkeeping, frame traffic and lane draining all belong to the
+/// transport's own executor, so a device-rich room can never cost the app a
+/// frame. The consequences for callers:
+///
+/// - `start`, `stop`, `updateAdvertisement`, `refreshDiscovery`, `disconnect`
+///   and `enqueue` are synchronous and nonisolated *by contract*: they hand
+///   the work over and return. They stay synchronous because game state is
+///   sent from the render cadence, and a hop per message would both cost
+///   more and stop preserving the order the sender chose.
+/// - `epoch` and `connectedPeers` are readable synchronously for the same
+///   reason: event filters and reconciliation run inside main-actor code that
+///   cannot suspend, like a background-expiration handler.
+/// - `events` is delivered on whichever executor the consumer picks. The app
+///   reads it on the main actor because what it does with an event is publish
+///   observable state.
+public protocol PeerTransport: AnyObject, Sendable {
 
     /// Single event stream. Has one consumer: the app's connectivity manager.
     var events: AsyncStream<PeerTransportEvent> { get }
 
-    /// Current epoch. Incremented on every `start`/`stop` to discard events
-    /// from a previous session.
+    /// Generation assigned synchronously when starting a new session or stopping.
+    /// Repeating `start` with unchanged flags may reuse the current generation.
     var epoch: UInt64 { get }
 
     /// Peers with a completed handshake, indexed by `applicationID`.
@@ -50,7 +66,7 @@ public protocol PeerTransport: AnyObject {
 
     /// Closes the physical connection to a peer. Only the manager should call
     /// this: leaving a room never closes the connection.
-    func disconnect(applicationID: String, reason: String?)
+    func disconnect(applicationID: String, reason: NexoReason?)
 
     // MARK: Sending
 

@@ -11,7 +11,7 @@ import Foundation
 ///
 /// Content never travels inside a `ChatMessage`: chat only carries metadata
 /// and the transfer ID, and the file itself arrives through this chunk sequence.
-public enum FileTransferMessage: Codable, Sendable {
+public enum FileTransferMessage: Codable, Sendable, Equatable {
     case offer(FileOffer)
     case accept(FileTransferControl)
     case reject(FileTransferRejection)
@@ -45,7 +45,7 @@ public struct FileOffer: Codable, Sendable, Identifiable, Hashable {
 
 // MARK: - FileChunk
 
-public struct FileChunk: Codable, Sendable {
+public struct FileChunk: Codable, Sendable, Equatable {
     public let transferID: UUID
     public let index: Int
     public let data: Data
@@ -53,18 +53,18 @@ public struct FileChunk: Codable, Sendable {
 
 // MARK: - Control payloads
 
-public struct FileTransferControl: Codable, Sendable {
+public struct FileTransferControl: Codable, Sendable, Equatable {
     public let transferID: UUID
     public let roomID: RoomID
 }
 
-public struct FileTransferRejection: Codable, Sendable {
+public struct FileTransferRejection: Codable, Sendable, Equatable {
     public let transferID: UUID
     public let roomID: RoomID
-    public let reason: String
+    public let reason: NexoReason
 }
 
-public struct FileTransferAcknowledgement: Codable, Sendable {
+public struct FileTransferAcknowledgement: Codable, Sendable, Equatable {
     public let transferID: UUID
     public let roomID: RoomID
     /// Index of the last chunk the receiver wrote to disk.
@@ -73,12 +73,12 @@ public struct FileTransferAcknowledgement: Codable, Sendable {
 
 // MARK: - FileTransferState
 
-public enum FileTransferState: Sendable, Equatable {
+public enum FileTransferState: Codable, Sendable, Equatable {
     case offered
     case accepted
     case transferring(progress: Double)
     case completed(url: URL)
-    case failed(String)
+    case failed(NexoReason)
     case cancelled
 
     public var progress: Double {
@@ -101,30 +101,31 @@ public enum FileTransferState: Sendable, Equatable {
 
 // MARK: - FileTransferError
 
-public enum FileTransferError: Error, LocalizedError, Sendable {
+public enum FileTransferError: Error, Codable, Sendable, Equatable {
     case tooLarge(Int64)
     case checksumMismatch
     case cancelled
     case unsupportedType(String)
-    case writeFailed(String)
+    case writeFailed(NexoReason)
     case incomplete
+    case bufferOverflow
+    case resourceLimit
+    case timedOut
+}
 
-    public var errorDescription: String? {
-        switch self {
-        case .tooLarge(let size):
-            let limit = ByteCountFormatter.string(fromByteCount: P2PLimits.maximumTransferBytes, countStyle: .file)
-            let actual = ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
-            return "El archivo pesa \(actual) y el límite es \(limit)."
-        case .checksumMismatch:
-            return "El archivo recibido está corrupto."
-        case .cancelled:
-            return "Transferencia cancelada."
-        case .unsupportedType(let mime):
-            return "No se admite el tipo de archivo \(mime)."
-        case .writeFailed(let reason):
-            return reason
-        case .incomplete:
-            return "La transferencia se interrumpió antes de terminar."
-        }
-    }
+/// A mixed delivery is not a successful delivery to the whole room.
+public enum FileTransferRecipientOutcome: Sendable, Equatable {
+    case pending
+    case completed
+    case rejected(NexoReason)
+}
+
+public enum FileTransferLimits {
+    public static let maximumOpenTransfers = 16
+    public static let maximumOpenTransfersPerPeer = 4
+    public static let maximumStoredTransfers = 256
+    public static let maximumReservedBytes: Int64 = 200 * 1024 * 1024
+    public static let maximumReservedBytesPerPeer: Int64 = 75 * 1024 * 1024
+    public static let maximumTerminalStates = 128
+    public static let inactivityTimeout: Duration = .seconds(60)
 }

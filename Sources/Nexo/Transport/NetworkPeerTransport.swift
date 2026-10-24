@@ -6,1136 +6,865 @@
 import Foundation
 import Network
 import OSLog
+import Synchronization
 
-// MARK: - NetworkPeerTransport
-
-/// P2P transport over Network framework's structured API (iOS 26).
-///
-/// Control traffic uses `Coder<P2PFrame> / TCP / IP`; bulk traffic uses
-/// authenticated QUIC streams over UDP/IP. Both services use Bonjour and
-/// peer-to-peer networking.
-@MainActor
-public final class NetworkPeerTransport: PeerTransport {
-
+/// TLS control traffic and QUIC binary channels, confined to a transport actor.
+public actor NetworkPeerTransport: PeerTransport {
     private static let logger = Logger(subsystem: "com.zafir.nexo", category: "transport")
+    private typealias ApplicationProtocol = Coder<P2PFrame, P2PFrame, NetworkJSONCoder>
+    private typealias Parameters = NWParametersBuilder<ApplicationProtocol>
+    private typealias Connection = NetworkConnection<ApplicationProtocol>
+    private typealias Listener = NetworkListener<ApplicationProtocol>
+    private typealias QUICListener = NetworkListener<QUIC>
 
-    // MARK: - Network Types
+    private enum Command: Sendable {
+        case start(advertising: Bool, browsing: Bool)
+        case stop
+        case updateAdvertisement(AdvertisementRecord)
+        case refreshDiscovery
+        case disconnect(String, NexoReason?)
+        case send(RoomEnvelope, String)
 
-    // `fileprivate`, not `private`: these types appear in signatures of
-    // extensions in this same file.
-    fileprivate typealias ApplicationProtocol = Coder<P2PFrame, P2PFrame, NetworkJSONCoder>
-    fileprivate typealias Parameters = NWParametersBuilder<ApplicationProtocol>
-    fileprivate typealias Connection = NetworkConnection<ApplicationProtocol>
-    fileprivate typealias Listener = NetworkListener<ApplicationProtocol>
-    fileprivate typealias QUICParameters = NWParametersBuilder<QUIC>
-    fileprivate typealias QUICConnection = NetworkConnection<QUIC>
-    fileprivate typealias QUICListener = NetworkListener<QUIC>
-
-    // MARK: - PeerConnectionBox
-
-    /// State of one physical connection.
-    @MainActor
-    fileprivate final class PeerConnectionBox {
-        let connectionID: TransportPeerID
-        let connection: Connection
-        let isOutgoing: Bool
-        /// Bonjour endpoint dialed, only set for outgoing connections.
-        ///
-        /// `connectionID` lives in Network's own identifier space and can't be
-        /// compared to a `Bonjour.Endpoint`'s; keeping this separately is what
-        /// lets us detect a second dial to the same endpoint.
-        let dialedEndpointID: TransportPeerID?
-        let sessionID = UUID()
-
-        /// Filled in once the remote's `hello` arrives.
-        var peer: ConnectedPeer?
-        var receiveTask: Task<Void, Never>?
-        var timeoutTask: Task<Void, Never>?
-        var readyContinuations: [CheckedContinuation<ConnectedPeer, Error>] = []
-        var queue: TransportSendQueue?
-
-        var isHandshakeComplete: Bool { peer != nil }
-
-        init(
-            connectionID: TransportPeerID,
-            connection: Connection,
-            isOutgoing: Bool,
-            dialedEndpointID: TransportPeerID? = nil
-        ) {
-            self.connectionID = connectionID
-            self.connection = connection
-            self.isOutgoing = isOutgoing
-            self.dialedEndpointID = dialedEndpointID
-        }
-
-        /// Resolves and clears everyone waiting on this handshake.
-        func resolve(with result: Result<ConnectedPeer, Error>) {
-            let waiting = readyContinuations
-            readyContinuations.removeAll()
-            for continuation in waiting {
-                continuation.resume(with: result)
-            }
-        }
-
-        func teardown() {
-            receiveTask?.cancel()
-            receiveTask = nil
-            timeoutTask?.cancel()
-            timeoutTask = nil
-            queue?.stop()
-            queue = nil
-        }
-    }
-
-    // MARK: - RetryGate
-
-    /// Bounded backoff for the pieces of the Bonjour stack.
-    ///
-    /// A listener or browser that fails is never rebuilt by Network on its own,
-    /// and without this the failure is permanent: `start` with unchanged flags
-    /// is a no-op. The budget is finite so a genuinely broken radio stops being
-    /// hammered instead of retrying until the app is killed.
-    @MainActor
-    fileprivate final class RetryGate {
-        private static let delays: [Duration] = [.seconds(2), .seconds(5), .seconds(10)]
-
-        private var attempt = 0
-        private var task: Task<Void, Never>?
-
-        func reset() {
-            attempt = 0
-            task?.cancel()
-            task = nil
-        }
-
-        /// Queues `body` after the next backoff step, if any is left.
-        func schedule(_ body: @escaping @MainActor () -> Void) {
-            guard attempt < Self.delays.count else { return }
-            let delay = Self.delays[attempt]
-            attempt += 1
-
-            task?.cancel()
-            task = Task { @MainActor in
-                try? await Task.sleep(for: delay)
-                guard !Task.isCancelled else { return }
-                body()
+        var budgetBytes: Int {
+            switch self {
+            case .send(let envelope, let peer):
+                return envelope.transportBudgetBytes + peer.utf8.count
+            case .updateAdvertisement(let record):
+                return record.applicationID.utf8.count + record.displayName.utf8.count
+                    + record.rooms.reduce(512) {
+                        $0 + $1.name.utf8.count + $1.hostApplicationID.utf8.count
+                            + ($1.activityKind?.rawValue.utf8.count ?? 0) + 512
+                    }
+            case .disconnect(let peer, let reason):
+                if case .system(let domain, _)? = reason { return peer.utf8.count + domain.utf8.count + 512 }
+                return peer.utf8.count + 512
+            default:
+                return 512
             }
         }
     }
 
-    // MARK: - Identity and advertisement
+    private struct PendingCommand: Sendable {
+        let epoch: UInt64
+        let command: Command
+    }
+
+    /// Admission and generation assignment share one lock, including the wakeup.
+    private struct Session: Sendable {
+        var epoch: UInt64 = 0
+        var isStopped = true
+        var advertising = false
+        var browsing = false
+        var commands: [PendingCommand] = []
+        var bytes = 0
+        var overloadedEpoch: UInt64?
+    }
+
+    private let session = Mutex(Session())
+    private let wakeup: AsyncStream<Void>.Continuation
+    private var activeEpoch: UInt64?
+    public nonisolated var epoch: UInt64 { session.withLock { $0.epoch } }
+    /// Reason for a disconnected lifecycle without changing the existing event enum.
+    public private(set) var lastFailure: NexoReason?
+
+    private enum Piece: CaseIterable, Hashable, Sendable { case listener, quicListener, browser, quicBrowser }
+    private struct Runner: Sendable {
+        let id: UUID
+        let task: Task<Void, Never>
+    }
+    private var runners: [Piece: Runner] = [:]
+    private var retries: [Piece: Task<Void, Never>] = [:]
+    private var retryAttempts: [Piece: Int] = [:]
+    private var listener: Listener?
+    private var quicListener: QUICListener?
+    private var isAdvertising = false
+    private var isBrowsing = false
+    public private(set) var localNetworkPermissionState: LocalNetworkPermissionState = .unknown
+    public var isTLSConfigured: Bool { tlsConfiguration != nil }
 
     private let applicationID: String
     private let localCertificateFingerprint: String?
     private let tlsConfiguration: NexoTLSConfiguration?
     private var advertisement: AdvertisementRecord
-
-    /// Bonjour service name. Derived from `applicationID`, not the display
-    /// name, so renaming the device only changes the TXT record without
-    /// restarting the listener or dropping open connections.
     private var serviceName: String { String(applicationID.prefix(8)).lowercased() }
-
-    // MARK: - Lifecycle
-
-    public private(set) var epoch: UInt64 = 0
-    private var isAdvertising = false
-    private var isBrowsing = false
-    private var _localNetworkPermissionState: LocalNetworkPermissionState = .unknown
-    
-    /// Current local network permission state.
-    ///
-    /// Updated automatically when the transport hits permission errors while
-    /// trying to listen or browse for peers.
-    public var localNetworkPermissionState: LocalNetworkPermissionState {
-        _localNetworkPermissionState
-    }
-    private var listener: Listener?
-    private var listenerTask: Task<Void, Never>?
-    private var quicListener: QUICListener?
-    private var quicListenerTask: Task<Void, Never>?
-    private var browserTask: Task<Void, Never>?
-    private var quicBrowserTask: Task<Void, Never>?
-
-    private let listenerRetry = RetryGate()
-    private let quicListenerRetry = RetryGate()
-    private let browserRetry = RetryGate()
-    private let quicBrowserRetry = RetryGate()
-
-    // MARK: - Events
-
     private let eventStream: AsyncStream<PeerTransportEvent>
     private let eventContinuation: AsyncStream<PeerTransportEvent>.Continuation
-
-    public var events: AsyncStream<PeerTransportEvent> { eventStream }
-
-    public var isTLSConfigured: Bool { tlsConfiguration != nil }
-
-    // MARK: - Discovery
-
+    public nonisolated var events: AsyncStream<PeerTransportEvent> { eventStream }
     private var advertisements: [TransportPeerID: PeerAdvertisement] = [:]
     private var endpoints: [TransportPeerID: Bonjour.Endpoint] = [:]
-    private var quicEndpointsByApplicationID: [String: Bonjour.Endpoint] = [:]
+    private var quicEndpoints: [String: Bonjour.Endpoint] = [:]
 
-    // MARK: - Connections
+    /// Mutable fields are confined to this actor; task captures use immutable socket identity.
+    private final class Box: @unchecked Sendable {
+        let id: TransportPeerID
+        let connection: Connection
+        let epoch: UInt64
+        let sessionID = UUID()
+        let isOutgoing: Bool
+        let endpointID: TransportPeerID?
+        let expectedApplicationID: String?
+        var peer: ConnectedPeer?
+        var receiveTask: Task<Void, Never>?
+        var helloTask: Task<Void, Never>?
+        var timeoutTask: Task<Void, Never>?
+        var queue: TransportSendQueue?
+        var waiters: [UUID: CheckedContinuation<ConnectedPeer, Error>] = [:]
 
-    /// Live connections indexed by Network's identifier.
-    private var boxes: [TransportPeerID: PeerConnectionBox] = [:]
-    /// Winning connection per peer, once handshaken.
-    private var connectionIDsByApplicationID: [String: TransportPeerID] = [:]
-    private var binaryTransportsByApplicationID: [String: NexoQUICBinaryTransport] = [:]
-    private var binaryIncomingTasksByApplicationID: [String: Task<Void, Never>] = [:]
+        init(connection: Connection, epoch: UInt64, isOutgoing: Bool,
+             endpointID: TransportPeerID? = nil, expectedApplicationID: String? = nil) {
+            self.id = TransportPeerID(connection.id)
+            self.connection = connection
+            self.epoch = epoch
+            self.isOutgoing = isOutgoing
+            self.endpointID = endpointID
+            self.expectedApplicationID = expectedApplicationID
+        }
+        deinit {
+            receiveTask?.cancel()
+            helloTask?.cancel()
+            timeoutTask?.cancel()
+            for waiter in waiters.values { waiter.resume(throwing: P2PTransportError.transportStopped) }
+        }
+        func resolve(_ result: Result<ConnectedPeer, Error>) {
+            let pending = waiters.values
+            waiters.removeAll()
+            for waiter in pending { waiter.resume(with: result) }
+        }
+        func cancel() -> TransportSendQueue? {
+            receiveTask?.cancel()
+            receiveTask = nil
+            helloTask?.cancel()
+            helloTask = nil
+            timeoutTask?.cancel()
+            timeoutTask = nil
+            let queue = queue
+            self.queue = nil
+            return queue
+        }
+    }
 
+    private var boxes: [TransportPeerID: Box] = [:]
+    private var farewellTasks: [UUID: Task<Void, Never>] = [:]
+    private var connectionIDs: [String: TransportPeerID] = [:]
+    private let establishedPeers = Mutex<[String: ConnectedPeer]>([:])
+    public nonisolated var connectedPeers: [ConnectedPeer] { establishedPeers.withLock { Array($0.values) } }
+
+    private struct BinaryChannel: Sendable {
+        let transport: NexoQUICBinaryTransport
+        let epoch: UInt64
+        var peer: ConnectedPeer?
+        var task: Task<Void, Never>?
+    }
+    private var binaryChannels: [UUID: BinaryChannel] = [:]
+    private var binaryIDs: [String: UUID] = [:]
+    private enum BinaryConsumer: Sendable, Equatable { case legacy, peer }
+    private let binaryConsumer = Mutex<BinaryConsumer?>(nil)
     private let incomingBinaryStream: AsyncStream<NexoQUICIncomingStream>
     private let incomingBinaryContinuation: AsyncStream<NexoQUICIncomingStream>.Continuation
     private let incomingPeerBinaryStream: AsyncStream<NexoPeerBinaryStream>
     private let incomingPeerBinaryContinuation: AsyncStream<NexoPeerBinaryStream>.Continuation
 
-    public var incomingBinaryStreams: AsyncStream<NexoQUICIncomingStream> {
-        incomingBinaryStream
+    /// Alternative views of one subscription. The first accessor claims it; never read both.
+    public nonisolated var incomingBinaryStreams: AsyncStream<NexoQUICIncomingStream> {
+        let accepted = binaryConsumer.withLock { consumer in
+            if consumer == nil { consumer = .legacy }
+            return consumer == .legacy
+        }
+        return accepted ? incomingBinaryStream : AsyncStream { $0.finish() }
+    }
+    public nonisolated var incomingPeerBinaryStreams: AsyncStream<NexoPeerBinaryStream> {
+        let accepted = binaryConsumer.withLock { consumer in
+            if consumer == nil { consumer = .peer }
+            return consumer == .peer
+        }
+        return accepted ? incomingPeerBinaryStream : AsyncStream { $0.finish() }
     }
 
-    public var incomingPeerBinaryStreams: AsyncStream<NexoPeerBinaryStream> {
-        incomingPeerBinaryStream
-    }
-
-    public var connectedPeers: [ConnectedPeer] {
-        connectionIDsByApplicationID.values.compactMap { boxes[$0]?.peer }
-    }
-
-    // MARK: - Init
-
-    public init(
-        applicationID: String,
-        displayName: String,
-        tlsConfiguration: NexoTLSConfiguration? = nil,
-        localCertificateFingerprint: String? = nil
-    ) {
+    public init(applicationID: String, displayName: String,
+                tlsConfiguration: NexoTLSConfiguration? = nil, localCertificateFingerprint: String? = nil) {
         self.applicationID = applicationID
         self.localCertificateFingerprint = localCertificateFingerprint
         self.tlsConfiguration = tlsConfiguration
-        self.advertisement = AdvertisementRecord(
-            applicationID: applicationID,
-            displayName: displayName
-        )
-
-        let stream = AsyncStream<PeerTransportEvent>.makeStream()
-        self.eventStream = stream.stream
-        self.eventContinuation = stream.continuation
-
-        let binaryStream = AsyncStream<NexoQUICIncomingStream>.makeStream()
-        self.incomingBinaryStream = binaryStream.stream
-        self.incomingBinaryContinuation = binaryStream.continuation
-
-        let peerBinaryStream = AsyncStream<NexoPeerBinaryStream>.makeStream()
-        self.incomingPeerBinaryStream = peerBinaryStream.stream
-        self.incomingPeerBinaryContinuation = peerBinaryStream.continuation
+        advertisement = AdvertisementRecord(applicationID: applicationID, displayName: displayName)
+        let events = AsyncStream<PeerTransportEvent>.makeStream(bufferingPolicy: .bufferingNewest(64))
+        eventStream = events.stream
+        eventContinuation = events.continuation
+        let signals = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        wakeup = signals.continuation
+        let binary = AsyncStream<NexoQUICIncomingStream>.makeStream(bufferingPolicy: .bufferingOldest(8))
+        incomingBinaryStream = binary.stream
+        incomingBinaryContinuation = binary.continuation
+        let peerBinary = AsyncStream<NexoPeerBinaryStream>.makeStream(bufferingPolicy: .bufferingOldest(8))
+        incomingPeerBinaryStream = peerBinary.stream
+        incomingPeerBinaryContinuation = peerBinary.continuation
+        Task { [weak self] in
+            for await _ in signals.stream {
+                while let work = self?.nextCommand() { await self?.apply(work) }
+            }
+        }
     }
 
     deinit {
-        listenerTask?.cancel()
-        quicListenerTask?.cancel()
-        browserTask?.cancel()
-        quicBrowserTask?.cancel()
-        for task in binaryIncomingTasksByApplicationID.values {
-            task.cancel()
-        }
+        wakeup.finish()
         eventContinuation.finish()
         incomingBinaryContinuation.finish()
         incomingPeerBinaryContinuation.finish()
+        for runner in runners.values { runner.task.cancel() }
+        for retry in retries.values { retry.cancel() }
+        for task in farewellTasks.values { task.cancel() }
+        for channel in binaryChannels.values {
+            channel.task?.cancel()
+            let transport = channel.transport
+            Task { await transport.close() }
+        }
     }
 
-    // MARK: - Lifecycle
+    // MARK: - Command admission
 
-    public func start(advertising: Bool, browsing: Bool) {
-        let advertisingChanged = isAdvertising != advertising
-        let browsingChanged = isBrowsing != browsing
+    public nonisolated func start(advertising: Bool, browsing: Bool) {
+        submit(.start(advertising: advertising, browsing: browsing))
+    }
+    public nonisolated func stop() { submit(.stop) }
+    public nonisolated func updateAdvertisement(_ record: AdvertisementRecord) { submit(.updateAdvertisement(record)) }
+    public nonisolated func refreshDiscovery() { submit(.refreshDiscovery) }
+    public nonisolated func disconnect(applicationID: String, reason: NexoReason?) { submit(.disconnect(applicationID, reason)) }
+    public nonisolated func enqueue(_ envelope: RoomEnvelope, to applicationID: String) { submit(.send(envelope, applicationID)) }
 
-        // A missing task means the previous attempt failed and gave up. The
-        // flags didn't change, but rebuilding is the only way back.
-        let needsListener = advertising && (listenerTask == nil || quicListenerTask == nil)
-        let needsBrowser = browsing && (browserTask == nil || quicBrowserTask == nil)
-
-        guard advertisingChanged || browsingChanged || needsListener || needsBrowser else { return }
-
-        epoch &+= 1
-        isAdvertising = advertising
-        isBrowsing = browsing
-        updateLocalNetworkPermission(.unknown)
-        resetRetryBudget()
-
-        if advertisingChanged || needsListener {
-            syncListener()
-            syncQUICListener()
+    private nonisolated func submit(_ command: Command) {
+        session.withLock { state in
+            switch command {
+            case .start(let advertising, let browsing):
+                if state.isStopped || state.overloadedEpoch == state.epoch
+                    || state.advertising != advertising || state.browsing != browsing { state.epoch &+= 1 }
+                state.isStopped = false
+                state.advertising = advertising
+                state.browsing = browsing
+            case .stop:
+                state.epoch &+= 1
+                state.isStopped = true
+            default: break
+            }
+            // Coalesce before admission, not after an unbounded AsyncStream backlog.
+            var replacement: Int?
+            if case .send(let envelope, let peer) = command {
+                for index in state.commands.indices.reversed() {
+                    guard state.commands[index].epoch == state.epoch,
+                          case .send(let previous, let previousPeer) = state.commands[index].command else { break }
+                    if peer == previousPeer && envelope.canReplace(previous) {
+                        replacement = index
+                        state.bytes -= state.commands.remove(at: index).command.budgetBytes
+                        break
+                    }
+                }
+            }
+            if state.commands.count >= 512 || command.budgetBytes > 8 * 1024 * 1024 - state.bytes {
+                state.overloadedEpoch = state.epoch
+                state.commands.removeAll()
+                state.bytes = 0
+            } else {
+                let pending = PendingCommand(epoch: state.epoch, command: command)
+                if let replacement { state.commands.insert(pending, at: replacement) }
+                else { state.commands.append(pending) }
+                state.bytes += command.budgetBytes
+            }
+            wakeup.yield(())
         }
-        if browsingChanged || needsBrowser {
-            syncBrowser()
-            syncQUICBrowser()
-        }
-
-        emit(.lifecycleChanged(.active, epoch: epoch))
     }
 
-    public func refreshDiscovery() {
-        resetRetryBudget()
-
-        if isAdvertising {
-            // Only rebuild what died: a healthy listener keeps accepting
-            // connections and re-creating it would interrupt them.
-            if listenerTask == nil { syncListener(isRecovery: true) }
-            if quicListenerTask == nil { syncQUICListener() }
-            republishTXTRecord()
+    private enum Work: Sendable { case command(PendingCommand), overloaded(UInt64) }
+    private nonisolated func nextCommand() -> Work? {
+        session.withLock { state in
+            if let failedEpoch = state.overloadedEpoch {
+                state.overloadedEpoch = nil
+                state.commands.removeAll { $0.epoch == failedEpoch }
+                state.bytes = state.commands.reduce(0) { $0 + $1.command.budgetBytes }
+                if state.epoch == failedEpoch { state.isStopped = true }
+                return .overloaded(failedEpoch)
+            }
+            guard !state.commands.isEmpty else { return nil }
+            let next = state.commands.removeFirst()
+            state.bytes -= next.command.budgetBytes
+            return .command(next)
         }
-
-        guard isBrowsing else { return }
-        syncBrowser()
-        syncQUICBrowser()
+    }
+    private nonisolated func isCurrent(_ token: UInt64) -> Bool {
+        session.withLock { !$0.isStopped && $0.epoch == token }
     }
 
-    public func stop() {
-        guard isAdvertising || isBrowsing || listenerTask != nil || browserTask != nil || !boxes.isEmpty else {
-            return
+    private func apply(_ work: Work) async {
+        switch work {
+        case .overloaded(let token):
+            guard epoch == token else { return }
+            lastFailure = .connectionFailed
+            await stopSession()
+            session.withLock { state in
+                guard state.epoch == token else { return }
+                state.isStopped = true
+                eventContinuation.yield(.lifecycleChanged(.disconnected, epoch: token))
+            }
+        case .command(let pending):
+            let token = pending.epoch
+            switch pending.command {
+            case .stop:
+                if activeEpoch.map({ $0 <= token }) ?? true { await stopSession() }
+            case .start(let advertising, let browsing):
+                guard isCurrent(token) else { return }
+                if activeEpoch != token { await stopSession() }
+                guard isCurrent(token) else { return }
+                guard tlsConfiguration != nil else {
+                    lastFailure = .invalidIdentity
+                    emit(.lifecycleChanged(.disconnected, epoch: token))
+                    return
+                }
+                activeEpoch = token
+                lastFailure = nil
+                isAdvertising = advertising
+                isBrowsing = browsing
+                resetRetries()
+                for piece in Piece.allCases where runners[piece] == nil { sync(piece, epoch: token) }
+                if !advertising || runners[.listener] != nil { emit(.lifecycleChanged(.active, epoch: token)) }
+            case .updateAdvertisement(let record):
+                advertisement = record
+                guard isCurrent(token), activeEpoch == token else { return }
+                republishTXTRecord()
+                if isAdvertising {
+                    if runners[.listener] == nil { sync(.listener, epoch: token) }
+                    if runners[.quicListener] == nil { sync(.quicListener, epoch: token) }
+                }
+            case .refreshDiscovery:
+                guard isCurrent(token), activeEpoch == token else { return }
+                resetRetries()
+                if runners[.listener] == nil { sync(.listener, epoch: token) }
+                if runners[.quicListener] == nil { sync(.quicListener, epoch: token) }
+                sync(.browser, epoch: token)
+                sync(.quicBrowser, epoch: token)
+                republishTXTRecord()
+            case .disconnect(let peer, let reason):
+                guard isCurrent(token), let id = connectionIDs[peer], let box = boxes[id] else { return }
+                await fail(box, error: P2PTransportError.connectionFailed(reason ?? .connectionClosed), sendGoodbye: true)
+            case .send(let envelope, let peer):
+                guard isCurrent(token), let id = connectionIDs[peer], let box = boxes[id], box.epoch == token else { return }
+                await box.queue?.enqueue(envelope)
+            }
         }
+    }
 
-        let stoppedEpoch = epoch
-        epoch &+= 1
+    private func stopSession() async {
+        activeEpoch = nil
         isAdvertising = false
         isBrowsing = false
-
-        resetRetryBudget()
-        listenerTask?.cancel()
-        listenerTask = nil
+        resetRetries()
+        for runner in runners.values { runner.task.cancel() }
+        runners.removeAll()
+        for task in farewellTasks.values { task.cancel() }
+        farewellTasks.removeAll()
         listener = nil
-        quicListenerTask?.cancel()
-        quicListenerTask = nil
         quicListener = nil
-        browserTask?.cancel()
-        browserTask = nil
-        quicBrowserTask?.cancel()
-        quicBrowserTask = nil
-        for task in binaryIncomingTasksByApplicationID.values {
-            task.cancel()
-        }
-        binaryIncomingTasksByApplicationID.removeAll()
-        quicEndpointsByApplicationID.removeAll()
-        binaryTransportsByApplicationID.removeAll()
-
-        // Established peers must be notified: otherwise the domain keeps
-        // thinking they're connected and never re-marks them after background.
-        let establishedPeers = boxes.values.compactMap(\.peer)
-
-        for box in boxes.values {
-            box.resolve(with: .failure(P2PTransportError.transportStopped))
-            box.teardown()
-        }
+        let closingBoxes = Array(boxes.values)
         boxes.removeAll()
-        connectionIDsByApplicationID.removeAll()
-
-        // These events belong to the epoch being closed. The manager discards
-        // them once they no longer match the active epoch, so a voluntary
-        // suspension is never treated as a real room disconnect.
-        for peer in establishedPeers {
-            emit(.peerDisconnected(
-                applicationID: peer.applicationID,
-                reason: "La conectividad se ha detenido.",
-                epoch: stoppedEpoch
-            ))
-        }
-
-        for endpointID in advertisements.keys {
-            emit(.advertisementLost(endpointID, epoch: stoppedEpoch))
-        }
+        connectionIDs.removeAll()
+        establishedPeers.withLock { $0.removeAll() }
+        let closingChannels = Array(binaryChannels.values)
+        binaryChannels.removeAll()
+        binaryIDs.removeAll()
         advertisements.removeAll()
         endpoints.removeAll()
-
-        emit(.lifecycleChanged(.disconnected, epoch: stoppedEpoch))
-    }
-
-    public func updateAdvertisement(_ record: AdvertisementRecord) {
-        guard record != advertisement else { return }
-        advertisement = record
-
-        guard isAdvertising else { return }
-
-        // A missing listener means an earlier attempt failed. Rebuild it: the
-        // equality guard above would otherwise block every retry of this record
-        // and the rooms would never be published.
-        if listenerTask == nil { syncListener(isRecovery: true) }
-        if quicListenerTask == nil { syncQUICListener() }
-
-        republishTXTRecord()
-    }
-
-    /// Writes the current advertisement into both services.
-    ///
-    /// The TXT record can be swapped live: the remote browser sees the change
-    /// without the service restarting or connections dropping. Unconditional,
-    /// unlike `updateAdvertisement`, so a swap that was dropped while a
-    /// listener was down can be re-applied.
-    private func republishTXTRecord() {
-        let record = NWTXTRecord(advertisement.txtDictionary)
-
-        if let listener {
-            var service = listener.service
-            service?.txtRecordObject = record
-            listener.service = service
+        quicEndpoints.removeAll()
+        for box in closingBoxes {
+            box.resolve(.failure(P2PTransportError.transportStopped))
+            await box.cancel()?.stop()
         }
-
-        if let quicListener {
-            var service = quicListener.service
-            service?.txtRecordObject = record
-            quicListener.service = service
-        }
-
-        // The display name travels in TXT, so a rename doesn't force
-        // recreating the listener either.
-    }
-
-    // MARK: - Connections
-
-    @discardableResult
-    public func connect(to advertisement: PeerAdvertisement) async throws -> ConnectedPeer {
-        // Reuses the existing physical connection: joining a second room with
-        // the same peer must not open another socket.
-        if let applicationID = advertisement.applicationID,
-           let existingID = connectionIDsByApplicationID[applicationID],
-           let peer = boxes[existingID]?.peer {
-            return peer
-        }
-
-        guard P2PProtocolInfo.isCompatible(remoteVersion: advertisement.protocolVersion) else {
-            throw P2PTransportError.incompatibleProtocol(advertisement.protocolVersion)
-        }
-
-        guard let endpoint = endpoints[advertisement.endpointID] else {
-            throw P2PTransportError.peerNotDiscovered
-        }
-
-        // If a dial to the same endpoint is already in flight, wait on it
-        // instead of opening a second socket. Without this check several
-        // connections appear in the same direction and tie-breaking stops being symmetric.
-        if let pending = boxes.values.first(where: {
-            $0.isOutgoing && $0.dialedEndpointID == advertisement.endpointID && !$0.isHandshakeComplete
-        }) {
-            return try await withCheckedThrowingContinuation { continuation in
-                pending.readyContinuations.append(continuation)
-            }
-        }
-
-        let connection = Connection(to: endpoint, using: makeParameters())
-        let box = register(
-            connection: connection,
-            isOutgoing: true,
-            dialedEndpointID: advertisement.endpointID
-        )
-
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                box.readyContinuations.append(continuation)
-                sendHello(on: box)
-            }
-        } onCancel: {
-            Task { @MainActor [weak self] in
-                self?.fail(box, error: CancellationError(), notifyPeer: true)
-            }
+        for channel in closingChannels {
+            channel.task?.cancel()
+            await channel.transport.close()
         }
     }
 
-    public func disconnect(applicationID: String, reason: String?) {
-        guard let connectionID = connectionIDsByApplicationID[applicationID],
-              let box = boxes[connectionID] else { return }
+    // MARK: - Bonjour stack
 
-        fail(
-            box,
-            error: P2PTransportError.connectionFailed(reason ?? "Conexión cerrada."),
-            notifyPeer: true
-        )
-    }
-
-    // MARK: - Sending
-
-    public func enqueue(_ envelope: RoomEnvelope, to applicationID: String) {
-        guard let connectionID = connectionIDsByApplicationID[applicationID],
-              let box = boxes[connectionID],
-              let queue = box.queue else { return }
-
-        queue.enqueue(envelope)
-    }
-
-    /// Opens a QUIC binary stream after the JSON connection has negotiated it.
-    public func openBinaryStream(
-        to applicationID: String,
-        descriptor: NexoStreamDescriptor
-    ) async throws -> NexoQUICByteStream {
-        guard let connectionID = connectionIDsByApplicationID[applicationID],
-              let peer = boxes[connectionID]?.peer,
-              peer.supports(.binaryStreams)
-        else {
-            throw P2PTransportError.connectionFailed("El peer no admite streams binarios.")
-        }
-
-        guard let endpoint = quicEndpointsByApplicationID[applicationID] else {
-            throw P2PTransportError.peerNotDiscovered
-        }
-
-        let transport: NexoQUICBinaryTransport
-        if let existing = binaryTransportsByApplicationID[applicationID] {
-            transport = existing
-        } else {
-            transport = NexoQUICBinaryTransport.connect(
-                to: endpoint.nwEndpoint,
-                applicationID: self.applicationID,
-                expectedRemoteApplicationID: applicationID,
-                tlsConfiguration: tlsConfiguration
-            )
-            binaryTransportsByApplicationID[applicationID] = transport
-            startIncomingBinaryStreams(from: transport, for: applicationID)
-        }
-
-        return try await transport.openStream(descriptor)
-    }
-}
-
-// MARK: - Network stack
-
-@MainActor
-private extension NetworkPeerTransport {
-
-    func makeParameters() -> Parameters {
-        if let tlsConfiguration {
-            return NWParametersBuilder(auto: {
-                Coder(P2PFrame.self, using: .json) {
-                    tlsConfiguration.configure(TLS {
-                        TCP {
-                            IP()
-                        }
-                    })
-                }
-            })
-            .peerToPeerIncluded(true)
-        }
-
+    private func parameters() throws(P2PTransportError) -> Parameters {
+        guard let tlsConfiguration else { throw .handshakeFailed(.invalidIdentity) }
         return NWParametersBuilder(auto: {
             Coder(P2PFrame.self, using: .json) {
-                TCP {
-                    IP()
-                }
+                tlsConfiguration.configure(TLS { TCP { IP() } }).peerAuthentication(.required).earlyDataEnabled(false)
             }
-        })
-        .peerToPeerIncluded(true)
+        }).peerToPeerIncluded(true)
     }
 
-    func makeQUICParameters() -> QUICParameters {
-        if let tlsConfiguration {
-            return NWParametersBuilder(auto: {
-                tlsConfiguration.configure(QUIC(
-                    alpn: ["nexo-binary-v1"],
-                    { UDP { IP() } }
-                ))
-            })
-            .peerToPeerIncluded(true)
-        }
-
-        return NWParametersBuilder(auto: {
-            QUIC(alpn: ["nexo-binary-v1"], { UDP { IP() } })
-        })
-        .peerToPeerIncluded(true)
-    }
-
-    func syncQUICListener() {
-        quicListenerTask?.cancel()
-        quicListenerTask = nil
-        quicListener = nil
-
-        guard isAdvertising else { return }
-
-        quicListenerTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            guard !Task.isCancelled else { return }
-
-            do {
-                let listener = try QUICListener(
-                    for: .bonjour(
-                        name: self.serviceName,
-                        type: P2PProtocolInfo.quicServiceType,
-                        domain: nil,
-                        txtRecord: NWTXTRecord(self.advertisement.txtDictionary)
-                    ),
-                    using: self.makeQUICParameters()
-                )
-                self.quicListener = listener
-                self.quicListenerRetry.reset()
-
-                try await listener.run { [weak self] connection in
-                    guard let self else { return }
-                    try await self.handleIncomingQUIC(connection)
-                }
-            } catch is CancellationError {
-                return
-            } catch {
-                Self.logger.error("QUIC listener failed: \(error.localizedDescription, privacy: .public)")
-                self.quicListener = nil
-                self.quicListenerTask = nil
-                guard !self.isLocalNetworkPermissionDenied(error) else { return }
-                self.scheduleRetry(self.quicListenerRetry, epochAtFailure: self.epoch, isStillBroken: { self.quicListenerTask == nil }) {
-                    self.syncQUICListener()
-                }
-            }
-        }
-    }
-
-    /// Builds the control-channel listener.
-    ///
-    /// `isRecovery` marks a rebuild after a failure: the listener reports
-    /// `.active` again so whoever saw the `.disconnected` stops treating the
-    /// transport as dead. The first build doesn't: `start` already emits it.
-    func syncListener(isRecovery: Bool = false) {
-        listenerTask?.cancel()
-        listenerTask = nil
-        listener = nil
-
-        guard isAdvertising else { return }
-
-        listenerTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            // `stop` cancels the task but can't stop a body that hasn't started:
-            // without this a listener is registered after the transport is down.
-            guard !Task.isCancelled else { return }
-
-            do {
-                let listener = try Listener(
-                    for: .bonjour(
-                        name: self.serviceName,
-                        type: P2PProtocolInfo.serviceType,
-                        domain: nil,
-                        txtRecord: NWTXTRecord(self.advertisement.txtDictionary)
-                    ),
-                    using: self.makeParameters()
-                )
+    private func sync(_ piece: Piece, epoch token: UInt64) {
+        runners.removeValue(forKey: piece)?.task.cancel()
+        guard isCurrent(token), activeEpoch == token, let tlsConfiguration else { return }
+        let id = UUID()
+        do {
+            let task: Task<Void, Never>
+            switch piece {
+            case .listener:
+                listener = nil
+                guard isAdvertising else { return }
+                let listener = try Listener(for: .bonjour(
+                    name: serviceName, type: P2PProtocolInfo.serviceType, domain: nil,
+                    txtRecord: NWTXTRecord(advertisement.txtDictionary)
+                ), using: parameters())
                 self.listener = listener
-                self.listenerRetry.reset()
-                if isRecovery {
-                    self.emit(.lifecycleChanged(.active, epoch: self.epoch))
+                task = Task { [weak self] in
+                    do {
+                        try await listener.run { [weak self] connection in
+                            guard let receive = await self?.accept(connection, epoch: token, runnerID: id) else { return }
+                            await withTaskCancellationHandler { await receive.value } onCancel: { receive.cancel() }
+                        }
+                    } catch { await self?.stackFailed(piece, id: id, epoch: token, error: error) }
                 }
-
-                try await listener.run { [weak self] connection in
-                    guard let self else { return }
-                    await self.handleIncoming(connection)
+            case .quicListener:
+                quicListener = nil
+                guard isAdvertising else { return }
+                let listener = try QUICListener(for: .bonjour(
+                    name: serviceName, type: P2PProtocolInfo.quicServiceType, domain: nil,
+                    txtRecord: NWTXTRecord(advertisement.txtDictionary)
+                ), using: NexoQUICBinaryTransport.parameters(tlsConfiguration))
+                quicListener = listener
+                task = Task { [weak self] in
+                    do {
+                        try await listener.run { [weak self] connection in
+                            guard let channel = await self?.acceptQUIC(connection, epoch: token, runnerID: id) else { return }
+                            await withTaskCancellationHandler { await channel.value } onCancel: { channel.cancel() }
+                        }
+                    } catch { await self?.stackFailed(piece, id: id, epoch: token, error: error) }
                 }
-            } catch is CancellationError {
-                return
-            } catch {
-                Self.logger.error("TCP listener failed: \(error.localizedDescription, privacy: .public)")
-                self.listener = nil
-                self.listenerTask = nil
-                if self.isLocalNetworkPermissionDenied(error) {
-                    self.updateLocalNetworkPermission(.denied)
-                } else {
-                    self.scheduleRetry(self.listenerRetry, epochAtFailure: self.epoch, isStillBroken: { self.listenerTask == nil }) {
-                        self.syncListener(isRecovery: true)
-                    }
+            case .browser, .quicBrowser:
+                guard isBrowsing else { return }
+                let browser = NetworkBrowser(for: .bonjour(
+                    piece == .browser ? P2PProtocolInfo.serviceType : P2PProtocolInfo.quicServiceType,
+                    domain: nil, includeTxtRecord: true
+                ), using: NWParameters().peerToPeerIncluded(true))
+                task = Task { [weak self] in
+                    do {
+                        try await browser.run { [weak self] found in
+                            await self?.discovered(found, piece: piece, id: id, epoch: token)
+                        }
+                    } catch { await self?.stackFailed(piece, id: id, epoch: token, error: error) }
                 }
-                self.emit(.lifecycleChanged(.disconnected, epoch: self.epoch))
             }
-        }
+            runners[piece] = Runner(id: id, task: task)
+        } catch { stackConstructionFailed(piece, epoch: token, error: error) }
     }
 
-    func syncBrowser() {
-        browserTask?.cancel()
-        browserTask = nil
-
-        guard isBrowsing else {
-            clearAdvertisements()
+    private func stackFailed(_ piece: Piece, id: UUID, epoch token: UInt64, error: any Error) {
+        guard isCurrent(token), activeEpoch == token, runners[piece]?.id == id else { return }
+        runners.removeValue(forKey: piece)
+        if piece == .listener { listener = nil }
+        if piece == .quicListener { quicListener = nil }
+        if piece == .browser { clearAdvertisements(epoch: token) }
+        if piece == .quicBrowser { quicEndpoints.removeAll() }
+        stackConstructionFailed(piece, epoch: token, error: error)
+    }
+    private func stackConstructionFailed(_ piece: Piece, epoch token: UInt64, error: any Error) {
+        guard isCurrent(token), activeEpoch == token, !(error is CancellationError) else { return }
+        Self.logger.error("Network service failed: \(error.localizedDescription, privacy: .public)")
+        lastFailure = NexoReason(error: error)
+        if NexoLocalNetworkPermission.isDenied(error) {
+            updatePermission(.denied, epoch: token)
+        } else {
+            let delays: [Duration] = [.seconds(2), .seconds(5), .seconds(10)]
+            let attempt = retryAttempts[piece, default: 0]
+            if attempt < delays.count {
+                retryAttempts[piece] = attempt + 1
+                retries[piece]?.cancel()
+                retries[piece] = Task { [weak self] in
+                    do { try await Task.sleep(for: delays[attempt]) } catch { return }
+                    await self?.retry(piece, epoch: token)
+                }
+            }
+        }
+        if piece == .listener { emit(.lifecycleChanged(.disconnected, epoch: token)) }
+    }
+    private func retry(_ piece: Piece, epoch token: UInt64) {
+        guard isCurrent(token), activeEpoch == token, runners[piece] == nil else { return }
+        sync(piece, epoch: token)
+        if piece == .listener, runners[piece] != nil { emit(.lifecycleChanged(.active, epoch: token)) }
+    }
+    private func resetRetries() {
+        for retry in retries.values { retry.cancel() }
+        retries.removeAll()
+        retryAttempts.removeAll()
+    }
+    private func updatePermission(_ state: LocalNetworkPermissionState, epoch token: UInt64) {
+        guard isCurrent(token), localNetworkPermissionState != state else { return }
+        localNetworkPermissionState = state
+        emit(.localNetworkPermissionChanged(state, epoch: token))
+    }
+    private func republishTXTRecord() {
+        let txt = NWTXTRecord(advertisement.txtDictionary)
+        if let listener {
+            var service = listener.service
+            service?.txtRecordObject = txt
+            listener.service = service
+        }
+        if let quicListener {
+            var service = quicListener.service
+            service?.txtRecordObject = txt
+            quicListener.service = service
+        }
+    }
+    private func discovered(_ found: [Bonjour.Endpoint], piece: Piece, id: UUID, epoch token: UInt64) {
+        guard isCurrent(token), activeEpoch == token, runners[piece]?.id == id else { return }
+        retryAttempts[piece] = 0
+        if piece == .quicBrowser {
+            quicEndpoints.removeAll()
+            for endpoint in found.prefix(256) {
+                guard let peer = endpoint.txtRecord.dictionary["aid"], peer != applicationID, peer.utf8.count <= 256 else { continue }
+                quicEndpoints[peer] = endpoint
+            }
             return
         }
-
-        browserTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            guard !Task.isCancelled else { return }
-
-            // `includeTxtRecord: true` is mandatory: without it the TXT
-            // record arrives empty and rooms can't be listed before connecting.
-            let browser = NetworkBrowser(
-                for: .bonjour(
-                    P2PProtocolInfo.serviceType,
-                    domain: nil,
-                    includeTxtRecord: true
-                ),
-                using: NWParameters().peerToPeerIncluded(true)
-            )
-
-            do {
-                try await browser.run { [weak self] endpoints in
-                    self?.browserRetry.reset()
-                    self?.updateLocalNetworkPermission(.available)
-                    self?.updateAdvertisements(endpoints)
-                }
-            } catch is CancellationError {
-                return
-            } catch {
-                Self.logger.error("TCP browser failed: \(error.localizedDescription, privacy: .public)")
-                self.browserTask = nil
-                self.clearAdvertisements()
-                if self.isLocalNetworkPermissionDenied(error) {
-                    self.updateLocalNetworkPermission(.denied)
-                } else {
-                    self.scheduleRetry(self.browserRetry, epochAtFailure: self.epoch, isStillBroken: { self.browserTask == nil }) {
-                        self.syncBrowser()
-                    }
-                }
-            }
-        }
-    }
-
-    func syncQUICBrowser() {
-        quicBrowserTask?.cancel()
-        quicBrowserTask = nil
-
-        guard isBrowsing else {
-            quicEndpointsByApplicationID.removeAll()
-            return
-        }
-
-        quicBrowserTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            guard !Task.isCancelled else { return }
-
-            let browser = NetworkBrowser(
-                for: .bonjour(
-                    P2PProtocolInfo.quicServiceType,
-                    domain: nil,
-                    includeTxtRecord: true
-                ),
-                using: NWParameters().peerToPeerIncluded(true)
-            )
-
-            do {
-                try await browser.run { [weak self] endpoints in
-                    self?.quicBrowserRetry.reset()
-                    self?.updateQUICEndpoints(endpoints)
-                }
-            } catch is CancellationError {
-                return
-            } catch {
-                Self.logger.error("QUIC browser failed: \(error.localizedDescription, privacy: .public)")
-                self.quicBrowserTask = nil
-                self.quicEndpointsByApplicationID.removeAll()
-                guard !self.isLocalNetworkPermissionDenied(error) else { return }
-                self.scheduleRetry(self.quicBrowserRetry, epochAtFailure: self.epoch, isStillBroken: { self.quicBrowserTask == nil }) {
-                    self.syncQUICBrowser()
-                }
-            }
-        }
-    }
-
-    /// Backs off a failed piece of the Bonjour stack.
-    ///
-    /// The epoch guard drops the retry if the transport was stopped and
-    /// restarted in between; `isStillBroken` drops it if something else
-    /// already rebuilt the piece.
-    func scheduleRetry(
-        _ gate: RetryGate,
-        epochAtFailure: UInt64,
-        isStillBroken: @escaping @MainActor () -> Bool,
-        rebuild: @escaping @MainActor () -> Void
-    ) {
-        gate.schedule { [weak self] in
-            guard let self, self.epoch == epochAtFailure, isStillBroken() else { return }
-            rebuild()
-        }
-    }
-
-    func resetRetryBudget() {
-        listenerRetry.reset()
-        quicListenerRetry.reset()
-        browserRetry.reset()
-        quicBrowserRetry.reset()
-    }
-
-    func updateLocalNetworkPermission(_ state: LocalNetworkPermissionState) {
-        guard _localNetworkPermissionState != state else { return }
-        _localNetworkPermissionState = state
-        emit(.localNetworkPermissionChanged(state, epoch: epoch))
-    }
-
-    func isLocalNetworkPermissionDenied(_ error: any Error) -> Bool {
-        NexoLocalNetworkPermission.isDenied(error)
-    }
-
-    func updateAdvertisements(_ discovered: [Bonjour.Endpoint]) {
+        updatePermission(.available, epoch: token)
         var seen: Set<TransportPeerID> = []
-
-        for endpoint in discovered {
+        for endpoint in found.prefix(256) {
             let endpointID = TransportPeerID(endpoint.id)
-
             let record = AdvertisementRecord.advertisement(
-                from: endpoint.txtRecord.dictionary,
-                endpointID: endpointID,
+                from: endpoint.txtRecord.dictionary, endpointID: endpointID,
                 fallbackName: endpoint.name.isEmpty ? endpoint.id : endpoint.name
             )
-
-            // The advertisement shows up in our own browser: must be filtered out.
             guard record.applicationID != applicationID else { continue }
-
             seen.insert(endpointID)
             endpoints[endpointID] = endpoint
-
-            // One installation can only be at one endpoint. If it reappears
-            // with a different identifier (renamed, interface change), the
-            // old one is stale and must be retired, or `connect` would dial it.
-            if let applicationID = record.applicationID {
-                for (staleID, stale) in advertisements
-                where staleID != endpointID && stale.applicationID == applicationID {
-                    advertisements.removeValue(forKey: staleID)
-                    endpoints.removeValue(forKey: staleID)
-                    emit(.advertisementLost(staleID, epoch: epoch))
+            if let peer = record.applicationID {
+                for (oldID, old) in advertisements where oldID != endpointID && old.applicationID == peer {
+                    advertisements.removeValue(forKey: oldID)
+                    endpoints.removeValue(forKey: oldID)
+                    emit(.advertisementLost(oldID, epoch: token))
                 }
             }
-
-            guard let previous = advertisements[endpointID] else {
-                advertisements[endpointID] = record
-                emit(.advertisementFound(record, epoch: epoch))
-                continue
-            }
-
-            if previous != record {
-                advertisements[endpointID] = record
-                emit(.advertisementUpdated(record, epoch: epoch))
-            }
+            let previous = advertisements.updateValue(record, forKey: endpointID)
+            if previous == nil { emit(.advertisementFound(record, epoch: token)) }
+            else if previous != record { emit(.advertisementUpdated(record, epoch: token)) }
         }
-
         for endpointID in advertisements.keys where !seen.contains(endpointID) {
             advertisements.removeValue(forKey: endpointID)
             endpoints.removeValue(forKey: endpointID)
-            emit(.advertisementLost(endpointID, epoch: epoch))
+            emit(.advertisementLost(endpointID, epoch: token))
         }
     }
-
-    func clearAdvertisements() {
-        for endpointID in advertisements.keys {
-            emit(.advertisementLost(endpointID, epoch: epoch))
-        }
+    private func clearAdvertisements(epoch token: UInt64) {
+        for endpointID in advertisements.keys { emit(.advertisementLost(endpointID, epoch: token)) }
         advertisements.removeAll()
         endpoints.removeAll()
     }
 
-    func updateQUICEndpoints(_ discovered: [Bonjour.Endpoint]) {
-        var seen: Set<String> = []
-
-        for endpoint in discovered {
-            guard let applicationID = endpoint.txtRecord.dictionary["aid"],
-                  applicationID != self.applicationID else { continue }
-
-            seen.insert(applicationID)
-            quicEndpointsByApplicationID[applicationID] = endpoint
-        }
-
-        for applicationID in quicEndpointsByApplicationID.keys
-        where !seen.contains(applicationID) {
-            quicEndpointsByApplicationID.removeValue(forKey: applicationID)
-            binaryTransportsByApplicationID.removeValue(forKey: applicationID)
-        }
-    }
-}
-
-// MARK: - Handshake and receiving
-
-@MainActor
-private extension NetworkPeerTransport {
-
-    func handleIncoming(_ connection: Connection) async {
-        let box = register(connection: connection, isOutgoing: false)
-        sendHello(on: box)
-
-        // The incoming connection lives as long as its receive loop runs;
-        // `listener.run`'s closure must not return before that.
-        if let receiveTask = box.receiveTask {
-            await receiveTask.value
-        }
-    }
-
-    func handleIncomingQUIC(_ connection: QUICConnection) async throws {
-        let transport = NexoQUICBinaryTransport(
-            connection: connection,
-            applicationID: applicationID
-        )
-        let streams = await transport.startIncoming()
-
-        for try await stream in streams {
-            binaryTransportsByApplicationID[stream.peerApplicationID] = transport
-            acceptIncomingBinaryStream(stream)
-        }
-    }
-
-    func startIncomingBinaryStreams(
-        from transport: NexoQUICBinaryTransport,
-        for applicationID: String
-    ) {
-        let streams = Task { await transport.startIncoming() }
-        binaryIncomingTasksByApplicationID[applicationID]?.cancel()
-        binaryIncomingTasksByApplicationID[applicationID] = Task { @MainActor [weak self] in
-            let incoming = await streams.value
-            do {
-                for try await stream in incoming {
-                    self?.acceptIncomingBinaryStream(stream)
-                }
-            } catch {
-                return
-            }
-        }
-    }
-
-    func acceptIncomingBinaryStream(_ stream: NexoQUICIncomingStream) {
-        guard let connectionID = connectionIDsByApplicationID[stream.peerApplicationID],
-              let peer = boxes[connectionID]?.peer,
-              peer.supports(.binaryStreams)
-        else { return }
-
-        incomingBinaryContinuation.yield(stream)
-        incomingPeerBinaryContinuation.yield(NexoPeerBinaryStream(
-            peer: peer,
-            descriptor: stream.descriptor,
-            stream: stream.stream
-        ))
-    }
+    // MARK: - TCP sessions
 
     @discardableResult
-    func register(
-        connection: Connection,
-        isOutgoing: Bool,
-        dialedEndpointID: TransportPeerID? = nil
-    ) -> PeerConnectionBox {
-        let connectionID = TransportPeerID(connection.id)
-        let box = PeerConnectionBox(
-            connectionID: connectionID,
-            connection: connection,
-            isOutgoing: isOutgoing,
-            dialedEndpointID: dialedEndpointID
-        )
-
-        box.queue = TransportSendQueue(
-            send: { [weak connection] envelope in
-                guard let connection else { throw P2PTransportError.notConnected }
-                try await connection.send(.envelope(envelope))
-            },
-            onFailure: { [weak self, weak box] error in
-                guard let self, let box else { return }
-                self.fail(box, error: error, notifyPeer: false)
-            }
-        )
-
-        boxes[connectionID] = box
-
-        box.receiveTask = Task { @MainActor [weak self] in
-            await self?.receiveLoop(box)
+    public func connect(to advertisement: PeerAdvertisement) async throws -> ConnectedPeer {
+        guard tlsConfiguration != nil else { throw P2PTransportError.handshakeFailed(.invalidIdentity) }
+        guard let token = activeEpoch, isCurrent(token) else { throw P2PTransportError.transportStopped }
+        if let applicationID = advertisement.applicationID,
+           let id = connectionIDs[applicationID], let peer = boxes[id]?.peer { return peer }
+        guard P2PProtocolInfo.isCompatible(remoteVersion: advertisement.protocolVersion) else {
+            throw P2PTransportError.incompatibleProtocol(advertisement.protocolVersion)
         }
-
-        box.timeoutTask = Task { @MainActor [weak self] in
+        guard let endpoint = endpoints[advertisement.endpointID] else { throw P2PTransportError.peerNotDiscovered }
+        let box: Box
+        if let pending = boxes.values.first(where: { $0.isOutgoing && $0.endpointID == advertisement.endpointID && $0.peer == nil }) {
+            box = pending
+        } else {
+            guard boxes.count < 64 else { throw P2PTransportError.connectionFailed(.connectionFailed) }
+            box = register(Connection(to: endpoint, using: try parameters()), epoch: token, outgoing: true,
+                           endpointID: advertisement.endpointID, expectedApplicationID: advertisement.applicationID)
+        }
+        guard box.waiters.count < 64 else { throw P2PTransportError.connectionFailed(.connectionFailed) }
+        let waiterID = UUID()
+        let peer = try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<ConnectedPeer, Error>) in
+                guard isCurrent(token), boxes[box.id] === box else {
+                    continuation.resume(throwing: P2PTransportError.transportStopped)
+                    return
+                }
+                if let peer = box.peer { continuation.resume(returning: peer) }
+                else if box.waiters.count < 64 { box.waiters[waiterID] = continuation }
+                else { continuation.resume(throwing: P2PTransportError.connectionFailed(.connectionFailed)) }
+            }
+        } onCancel: {
+            Task { [weak self] in await self?.cancelWaiter(waiterID, on: box.id) }
+        }
+        guard isCurrent(token), boxes[box.id] === box else { throw P2PTransportError.transportStopped }
+        return peer
+    }
+    private func cancelWaiter(_ id: UUID, on connectionID: TransportPeerID) async {
+        guard let box = boxes[connectionID] else { return }
+        box.waiters.removeValue(forKey: id)?.resume(throwing: CancellationError())
+        if box.waiters.isEmpty, box.peer == nil { await fail(box, error: CancellationError()) }
+    }
+    private func accept(_ connection: Connection, epoch token: UInt64, runnerID: UUID) -> Task<Void, Never>? {
+        guard isCurrent(token), activeEpoch == token, runners[.listener]?.id == runnerID, boxes.count < 64 else { return nil }
+        return register(connection, epoch: token, outgoing: false).receiveTask
+    }
+    private func register(_ connection: Connection, epoch token: UInt64, outgoing: Bool,
+                          endpointID: TransportPeerID? = nil, expectedApplicationID: String? = nil) -> Box {
+        let box = Box(connection: connection, epoch: token, isOutgoing: outgoing,
+                      endpointID: endpointID, expectedApplicationID: expectedApplicationID)
+        boxes[box.id] = box
+        box.queue = TransportSendQueue(send: { [weak connection] envelope in
+            guard let connection else { throw P2PTransportError.notConnected }
+            try await connection.send(.envelope(envelope))
+        }, onFailure: { [weak self, weak box] error in
+            guard let box else { return }
+            await self?.fail(box, error: error)
+        })
+        // Socket awaits do not retain the owner of these long-running tasks.
+        box.receiveTask = Task { [weak self, weak box] in
             do {
-                try await Task.sleep(for: P2PLimits.handshakeTimeout)
-            } catch {
-                return
-            }
-            guard let self, !box.isHandshakeComplete else { return }
-            self.fail(box, error: P2PTransportError.handshakeTimedOut, notifyPeer: true)
+                for try await message in connection.messages {
+                    guard let box, !Task.isCancelled else { return }
+                    await self?.handle(message.content, on: box)
+                }
+                if let box { await self?.fail(box, error: P2PTransportError.connectionFailed(.connectionClosed)) }
+            } catch { if let box { await self?.fail(box, error: error) } }
         }
-
+        box.timeoutTask = Task { [weak self, weak box] in
+            do { try await Task.sleep(for: P2PLimits.handshakeTimeout) } catch { return }
+            guard let box else { return }
+            await self?.handshakeTimedOut(box)
+        }
+        let hello = P2PFrame.hello(HelloBody(applicationID: applicationID, displayName: advertisement.displayName,
+                                            certificateFingerprint: localCertificateFingerprint))
+        box.helloTask = Task { [weak self, weak box] in
+            do { try await connection.send(hello) }
+            catch { if let box { await self?.fail(box, error: error) } }
+        }
         return box
     }
-
-    func sendHello(on box: PeerConnectionBox) {
-        let body = HelloBody(
-            applicationID: applicationID,
-            displayName: advertisement.displayName,
-            certificateFingerprint: localCertificateFingerprint
-        )
-
-        Task { @MainActor [weak self, weak box] in
-            guard let box else { return }
-            do {
-                try await box.connection.send(.hello(body))
-            } catch {
-                self?.fail(box, error: error, notifyPeer: false)
-            }
-        }
+    private func handshakeTimedOut(_ box: Box) async {
+        guard box.peer == nil else { return }
+        await fail(box, error: P2PTransportError.handshakeTimedOut)
     }
-
-    func receiveLoop(_ box: PeerConnectionBox) async {
-        do {
-            for try await message in box.connection.messages {
-                handle(message.content, on: box)
-            }
-            // Clean end of stream: the peer dropped the connection.
-            fail(
-                box,
-                error: P2PTransportError.connectionFailed("El otro dispositivo cerró la conexión."),
-                notifyPeer: false
-            )
-        } catch is CancellationError {
-            return
-        } catch {
-            fail(box, error: error, notifyPeer: false)
-        }
-    }
-
-    func handle(_ frame: P2PFrame, on box: PeerConnectionBox) {
+    private func handle(_ frame: P2PFrame, on box: Box) async {
+        guard isCurrent(box.epoch), activeEpoch == box.epoch, boxes[box.id] === box else { return }
         switch frame.kind {
         case .hello:
-            guard let body = frame.hello else {
-                fail(box, error: P2PTransportError.handshakeFailed("Hello incompleto."), notifyPeer: true)
-                return
-            }
-            completeHandshake(body, on: box)
-
+            guard let body = frame.hello else { await fail(box, error: P2PTransportError.handshakeFailed(.incompleteHello)); return }
+            await completeHandshake(body, on: box)
         case .envelope:
             guard let peer = box.peer, let envelope = frame.envelope else { return }
-
-            guard envelope.protocolVersion >= P2PProtocolInfo.minimumVersion else {
-                fail(
-                    box,
-                    error: P2PTransportError.incompatibleProtocol(envelope.protocolVersion),
-                    notifyPeer: true
-                )
-                return
+            guard P2PProtocolInfo.isCompatible(remoteVersion: envelope.protocolVersion),
+                  envelope.senderApplicationID == peer.applicationID,
+                  envelope.payload.count <= P2PLimits.maximumEnvelopeBytes,
+                  envelope.transportBudgetBytes <= P2PLimits.maximumEnvelopeBytes + 4096 else {
+                await fail(box, error: P2PTransportError.connectionFailed(.connectionFailed)); return
             }
-
-            // A peer can't sign an envelope on another's behalf.
-            guard envelope.senderApplicationID == peer.applicationID else { return }
-
-            guard envelope.payload.count <= P2PLimits.maximumEnvelopeBytes else { return }
-
-            emit(.received(envelope, from: peer, epoch: epoch))
-
+            emit(.received(envelope, from: peer, epoch: box.epoch))
         case .goodbye:
-            let reason = frame.goodbye?.reason ?? "El otro dispositivo se ha desconectado."
-            fail(box, error: P2PTransportError.connectionFailed(reason), notifyPeer: false)
+            await fail(box, error: P2PTransportError.connectionFailed(frame.goodbye?.reason ?? .peerDisconnected))
         }
     }
-
-    func completeHandshake(_ body: HelloBody, on box: PeerConnectionBox) {
-        guard !box.isHandshakeComplete else { return }
-
+    private func completeHandshake(_ body: HelloBody, on box: Box) async {
+        guard box.peer == nil else { return }
         guard P2PProtocolInfo.isCompatible(remoteVersion: body.protocolVersion),
               body.minimumProtocolVersion <= P2PProtocolInfo.currentVersion else {
-            fail(
-                box,
-                error: P2PTransportError.incompatibleProtocol(body.protocolVersion),
-                notifyPeer: true
-            )
-            return
+            await fail(box, error: P2PTransportError.incompatibleProtocol(body.protocolVersion)); return
         }
-
-        guard !body.applicationID.isEmpty, body.applicationID != applicationID else {
-            fail(box, error: P2PTransportError.handshakeFailed("Identidad inválida."), notifyPeer: true)
-            return
+        guard !body.applicationID.isEmpty, body.applicationID != applicationID,
+              body.applicationID.utf8.count <= 256, body.displayName.utf8.count <= 1024,
+              box.expectedApplicationID == nil || box.expectedApplicationID == body.applicationID else {
+            await fail(box, error: P2PTransportError.handshakeFailed(.invalidIdentity)); return
         }
-
-        // Both devices advertise and browse at once, so they can open two
-        // simultaneous connections. The tie-break rule is deterministic and
-        // both ends reach the same conclusion, so they discard the same one.
-        if let rivalID = connectionIDsByApplicationID[body.applicationID],
-           let rival = boxes[rivalID], rival !== box {
-            let keepOutgoing = min(applicationID, body.applicationID) == applicationID
-            let loser = keepOutgoing
-                ? (box.isOutgoing ? rival : box)
-                : (box.isOutgoing ? box : rival)
-
-            if loser === box {
-                discardDuplicate(box)
-                return
+        let fingerprint: String
+        do {
+            guard let metadata = box.connection.metadata(definition: NWProtocolTLS.definition) as? NWProtocolTLS.Metadata else {
+                throw P2PTransportError.handshakeFailed(.invalidIdentity)
             }
-            discardDuplicate(loser)
+            fingerprint = try NexoTLSPeerIdentity.fingerprint(from: metadata.securityProtocolMetadata)
+        } catch { await fail(box, error: error); return }
+        if let rivalID = connectionIDs[body.applicationID], let rival = boxes[rivalID], rival !== box {
+            // An asserted ID cannot evict a live session with a different TLS key.
+            guard rival.peer?.certificateFingerprint == fingerprint else {
+                await fail(box, error: P2PTransportError.handshakeFailed(.invalidIdentity)); return
+            }
+            let keepOutgoing = min(applicationID, body.applicationID) == applicationID
+            let loser = keepOutgoing ? (box.isOutgoing ? rival : box) : (box.isOutgoing ? box : rival)
+            await fail(loser, error: P2PTransportError.connectionFailed(.duplicateConnection), notify: false, sendGoodbye: true)
+            if loser === box { return }
         }
-
-        let peer = ConnectedPeer(
-            applicationID: body.applicationID,
-            displayName: body.displayName.isEmpty ? "Dispositivo cercano" : body.displayName,
-            certificateFingerprint: body.certificateFingerprint,
-            protocolVersion: body.protocolVersion,
-            capabilities: Set(body.capabilities),
-            connectionSessionID: box.sessionID
-        )
-
+        guard isCurrent(box.epoch), activeEpoch == box.epoch, boxes[box.id] === box else { return }
+        let peer = ConnectedPeer(applicationID: body.applicationID, displayName: body.displayName,
+            certificateFingerprint: fingerprint, protocolVersion: body.protocolVersion,
+            capabilities: Set(body.capabilities), connectionSessionID: box.sessionID)
         box.peer = peer
         box.timeoutTask?.cancel()
         box.timeoutTask = nil
-        connectionIDsByApplicationID[body.applicationID] = box.connectionID
-
-        box.resolve(with: .success(peer))
-
-        emit(.peerConnected(peer, epoch: epoch))
+        connectionIDs[peer.applicationID] = box.id
+        establishedPeers.withLock { $0[peer.applicationID] = peer }
+        box.resolve(.success(peer))
+        emit(.peerConnected(peer, epoch: box.epoch))
     }
-
-    /// Closes the loser of a tie without emitting `peerDisconnected`: the
-    /// peer is still connected through the other connection.
-    func discardDuplicate(_ box: PeerConnectionBox) {
-        box.resolve(with: .failure(P2PTransportError.connectionFailed("Conexión duplicada.")))
-
-        let connection = box.connection
-        Task { @MainActor in
-            try? await connection.send(.goodbye(reason: "Conexión duplicada."))
+    private func fail(_ box: Box, error: any Error, notify: Bool = true, sendGoodbye: Bool = false) async {
+        guard boxes[box.id] === box else { return }
+        // Remove indexes before suspension; stale teardown cannot evict a replacement.
+        boxes.removeValue(forKey: box.id)
+        if sendGoodbye, isCurrent(box.epoch) { beginGoodbye(on: box.connection, reason: NexoReason(error: error)) }
+        box.resolve(.failure(error))
+        let queue = box.cancel()
+        var channels: [BinaryChannel] = []
+        if let peer = box.peer, connectionIDs[peer.applicationID] == box.id {
+            connectionIDs.removeValue(forKey: peer.applicationID)
+            establishedPeers.withLock { stored in
+                if stored[peer.applicationID]?.connectionSessionID == peer.connectionSessionID { stored.removeValue(forKey: peer.applicationID) }
+            }
+            for (id, channel) in binaryChannels where channel.peer?.connectionSessionID == peer.connectionSessionID {
+                channels.append(channel)
+                binaryChannels.removeValue(forKey: id)
+            }
+            binaryIDs.removeValue(forKey: peer.applicationID)
+            if notify { emit(.peerDisconnected(applicationID: peer.applicationID, reason: NexoReason(error: error), epoch: box.epoch)) }
         }
-
-        box.teardown()
-        boxes.removeValue(forKey: box.connectionID)
+        await queue?.stop()
+        for channel in channels {
+            channel.task?.cancel()
+            await channel.transport.close()
+        }
     }
 
-    /// The single teardown path. Drops the connection (Network offers no
-    /// `cancel()` on iOS 26) and notifies the domain only if the peer had
-    /// been established.
-    func fail(_ box: PeerConnectionBox, error: Error, notifyPeer: Bool) {
-        guard boxes[box.connectionID] != nil else { return }
+    private func beginGoodbye(on connection: Connection, reason: NexoReason) {
+        guard farewellTasks.count < 64 else { return }
+        let id = UUID()
+        farewellTasks[id] = Task { [weak self] in
+            do {
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    group.addTask { try await connection.send(.goodbye(reason: reason)) }
+                    group.addTask { try await Task.sleep(for: .seconds(1)) }
+                    defer { group.cancelAll() }
+                    _ = try await group.next()
+                }
+            } catch { /* The connection may already have closed. */ }
+            await self?.farewellEnded(id)
+        }
+    }
 
-        if notifyPeer {
-            let connection = box.connection
-            let reason = error.localizedDescription
-            Task { @MainActor in
-                try? await connection.send(.goodbye(reason: reason))
+    private func farewellEnded(_ id: UUID) { farewellTasks.removeValue(forKey: id) }
+
+    // MARK: - Authenticated QUIC channels
+
+    public func openBinaryStream(to peerID: String, descriptor: NexoStreamDescriptor) async throws -> NexoQUICByteStream {
+        guard let token = activeEpoch, isCurrent(token), let id = connectionIDs[peerID],
+              let peer = boxes[id]?.peer, peer.supports(.binaryStreams) else {
+            throw P2PTransportError.connectionFailed(.binaryStreamsUnsupported)
+        }
+        let transport: NexoQUICBinaryTransport
+        if let binaryID = binaryIDs[peerID], let existing = binaryChannels[binaryID] {
+            transport = existing.transport
+        } else {
+            guard let endpoint = quicEndpoints[peerID] else { throw P2PTransportError.peerNotDiscovered }
+            guard binaryChannels.count < 16 else { throw P2PTransportError.connectionFailed(.connectionFailed) }
+            let binaryID = UUID()
+            transport = try NexoQUICBinaryTransport.connect(
+                to: endpoint.nwEndpoint, applicationID: applicationID, expectedRemoteApplicationID: peerID,
+                tlsConfiguration: tlsConfiguration, authenticatePeer: { [weak self] remoteID, fingerprint in
+                    guard let self else { throw P2PTransportError.transportStopped }
+                    return try await self.authenticateBinary(remoteID, fingerprint: fingerprint,
+                        candidates: [peer], binaryID: binaryID, epoch: token)
+                })
+            binaryChannels[binaryID] = BinaryChannel(transport: transport, epoch: token, peer: peer)
+            binaryIDs[peerID] = binaryID
+            startBinaryReceiver(transport, id: binaryID, epoch: token)
+        }
+        do {
+            let stream = try await transport.openStream(descriptor)
+            guard isCurrent(token), boxes[id]?.peer?.connectionSessionID == peer.connectionSessionID else {
+                await transport.close()
+                throw P2PTransportError.transportStopped
+            }
+            return stream
+        } catch { await transport.close(); throw error }
+    }
+    private func acceptQUIC(_ connection: NetworkConnection<QUIC>, epoch token: UInt64, runnerID: UUID) -> Task<Void, Never>? {
+        guard isCurrent(token), activeEpoch == token, runners[.quicListener]?.id == runnerID,
+              binaryChannels.count < 16 else { return nil }
+        // Freeze candidate TCP sessions at channel acceptance, before any declared QUIC ID.
+        let candidates = boxes.values.compactMap(\.peer)
+        guard !candidates.isEmpty else { return nil }
+        let id = UUID()
+        let transport = NexoQUICBinaryTransport(connection: connection, applicationID: applicationID,
+            authenticatePeer: { [weak self] remoteID, fingerprint in
+                guard let self else { throw P2PTransportError.transportStopped }
+                return try await self.authenticateBinary(remoteID, fingerprint: fingerprint,
+                    candidates: candidates, binaryID: id, epoch: token)
+            })
+        binaryChannels[id] = BinaryChannel(transport: transport, epoch: token)
+        startBinaryReceiver(transport, id: id, epoch: token)
+        return binaryChannels[id]?.task
+    }
+    private func authenticateBinary(_ peerID: String, fingerprint: String, candidates: [ConnectedPeer],
+                                    binaryID: UUID, epoch token: UInt64) throws -> ConnectedPeer {
+        guard isCurrent(token), activeEpoch == token,
+              let candidate = candidates.first(where: { $0.applicationID == peerID }),
+              candidate.certificateFingerprint == fingerprint, candidate.supports(.binaryStreams),
+              let id = connectionIDs[peerID], boxes[id]?.peer?.connectionSessionID == candidate.connectionSessionID,
+              binaryChannels[binaryID]?.epoch == token else { throw P2PTransportError.handshakeFailed(.invalidIdentity) }
+        binaryChannels[binaryID]?.peer = candidate
+        if binaryIDs[peerID] == nil { binaryIDs[peerID] = binaryID }
+        return candidate
+    }
+    private func startBinaryReceiver(_ transport: NexoQUICBinaryTransport, id: UUID, epoch token: UInt64) {
+        binaryChannels[id]?.task = Task { [weak self] in
+            let streams = await transport.startIncoming()
+            do {
+                for try await stream in streams {
+                    guard !Task.isCancelled else { break }
+                    await self?.acceptBinary(stream, id: id, epoch: token)
+                }
+            } catch { /* Closing a channel finishes its incoming subscription. */ }
+            await transport.close()
+            await self?.binaryEnded(id, epoch: token)
+        }
+    }
+    private func acceptBinary(_ stream: NexoQUICIncomingStream, id: UUID, epoch token: UInt64) async {
+        guard isCurrent(token), let authenticated = stream.authenticatedPeer,
+              binaryChannels[id]?.peer == authenticated,
+              let connectionID = connectionIDs[authenticated.applicationID], let box = boxes[connectionID],
+              box.peer?.connectionSessionID == authenticated.connectionSessionID else {
+            if let transport = binaryChannels[id]?.transport { await transport.close() }
+            return
+        }
+        let accepted: Bool
+        switch binaryConsumer.withLock({ $0 }) {
+        case .legacy:
+            if case .enqueued = incomingBinaryContinuation.yield(stream) { accepted = true } else { accepted = false }
+        case .peer:
+            if case .enqueued = incomingPeerBinaryContinuation.yield(.init(
+                peer: authenticated, descriptor: stream.descriptor, stream: stream.stream
+            )) { accepted = true } else { accepted = false }
+        case nil: accepted = false
+        }
+        if !accepted { await fail(box, error: P2PTransportError.connectionFailed(.connectionFailed)) }
+    }
+    private func binaryEnded(_ id: UUID, epoch token: UInt64) {
+        guard let channel = binaryChannels[id], channel.epoch == token else { return }
+        binaryChannels.removeValue(forKey: id)
+        if let peer = channel.peer, binaryIDs[peer.applicationID] == id { binaryIDs.removeValue(forKey: peer.applicationID) }
+    }
+    private nonisolated func emit(_ event: PeerTransportEvent) {
+        session.withLock { state in
+            guard !state.isStopped, state.epoch == event.epoch else { return }
+            if case .dropped = eventContinuation.yield(event) {
+                // Reliable event loss terminates the session rather than pretending delivery succeeded.
+                state.overloadedEpoch = event.epoch
+                wakeup.yield(())
             }
         }
-
-        box.resolve(with: .failure(error))
-        box.teardown()
-        boxes.removeValue(forKey: box.connectionID)
-
-        guard let peer = box.peer else { return }
-
-        // Only clean up the index if this was the peer's current connection.
-        if connectionIDsByApplicationID[peer.applicationID] == box.connectionID {
-            connectionIDsByApplicationID.removeValue(forKey: peer.applicationID)
-            binaryIncomingTasksByApplicationID.removeValue(forKey: peer.applicationID)?.cancel()
-            binaryTransportsByApplicationID.removeValue(forKey: peer.applicationID)
-            emit(.peerDisconnected(
-                applicationID: peer.applicationID,
-                reason: error.localizedDescription,
-                epoch: epoch
-            ))
-        }
-    }
-
-    func emit(_ event: PeerTransportEvent) {
-        eventContinuation.yield(event)
     }
 }
 
 // MARK: - NexoLocalNetworkPermission
 
 enum NexoLocalNetworkPermission {
-    /// mDNSResponder rejects listening and browsing with `kDNSServiceErr_NoAuth`
-    /// (-65555) when local network permission is not granted, and NWError wraps
-    /// it as `.dns`: without checking it explicitly, the denial would surface
-    /// as a generic failure and the UI would never reflect it.
+    /// mDNSResponder wraps denied local-network permission in a DNS NoAuth error.
     static func isDenied(_ error: any Error) -> Bool {
         if let networkError = error as? NWError {
             switch networkError {
-            case .posix(.EACCES), .posix(.EPERM):
-                return true
-            case .dns(let code) where code == -65555:
-                return true
-            default:
-                break
+            case .posix(.EACCES), .posix(.EPERM): return true
+            case .dns(let code) where code == -65555: return true
+            default: break
             }
         }
-
         let description = String(describing: error) + " " + error.localizedDescription
         return description.localizedCaseInsensitiveContains("PolicyDenied")
             || description.localizedCaseInsensitiveContains("policy denied")

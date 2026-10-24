@@ -12,16 +12,14 @@ import Foundation
 /// Replaces singleton channels: every consumer gets a `RoomOutbox` bound to
 /// *its* room, so it can't write into another room and never needs to know
 /// about the transport.
-@MainActor
+@NexoActor
 public final class RoomOutbox {
 
     public let roomID: RoomID
 
     private let transport: any PeerTransport
     private let identity: LocalP2PIdentity
-    /// Members to broadcast to, excluding the local user. Resolved on every
-    /// send so live membership is never captured stale.
-    private let recipients: @MainActor () -> [String]
+    private let isPeerAdmitted: @NexoActor @Sendable (String) -> Bool
 
     private var sequence: UInt64 = 0
 
@@ -42,12 +40,12 @@ public final class RoomOutbox {
         roomID: RoomID,
         transport: any PeerTransport,
         identity: LocalP2PIdentity,
-        recipients: @escaping @MainActor () -> [String]
+        isPeerAdmitted: @escaping @NexoActor @Sendable (String) -> Bool
     ) {
         self.roomID = roomID
         self.transport = transport
         self.identity = identity
-        self.recipients = recipients
+        self.isPeerAdmitted = isPeerAdmitted
     }
 
     // MARK: - Public API
@@ -61,7 +59,7 @@ public final class RoomOutbox {
         _ message: Message,
         channel: RoomChannel,
         activityID: ActivityID? = nil,
-        to applicationIDs: [String]? = nil,
+        to recipients: [String],
         delivery: DeliveryMode = .reliable,
         coalescingKey: String? = nil
     ) {
@@ -73,12 +71,11 @@ public final class RoomOutbox {
             coalescingKey: coalescingKey
         ) else { return }
 
-        let targets = (applicationIDs ?? recipients())
-            .filter { $0 != identity.applicationID }
+        let targets = recipients.filter { $0 != identity.applicationID }
         guard !targets.isEmpty else { return }
 
         appendToRecoveryJournal(envelope, recipients: targets)
-        for target in targets {
+        for target in targets where isPeerAdmitted(target) {
             transport.enqueue(envelope, to: target)
         }
     }
@@ -86,6 +83,7 @@ public final class RoomOutbox {
     /// Replays recent messages to a peer that just recovered its socket.
     /// Message IDs are preserved so the receiver can idempotently drop duplicates.
     public func replay(to applicationID: String) {
+        guard isPeerAdmitted(applicationID) else { return }
         pruneRecoveryJournal()
         for entry in recoveryJournal where entry.recipients.contains(applicationID) {
             transport.enqueue(entry.envelope, to: applicationID)
@@ -101,13 +99,13 @@ public final class RoomOutbox {
         channel: RoomChannel,
         activityID: ActivityID? = nil,
         coalescingKey: String,
-        to applicationIDs: [String]? = nil
+        to recipients: [String]
     ) {
         send(
             message,
             channel: channel,
             activityID: activityID,
-            to: applicationIDs,
+            to: recipients,
             delivery: .unreliable,
             coalescingKey: coalescingKey
         )
@@ -130,14 +128,9 @@ public final class RoomOutbox {
                $0.envelope.channel == envelope.channel
                    && $0.envelope.activityID == envelope.activityID
                    && $0.envelope.coalescingKey == coalescingKey
+                   && $0.recipients == recipientSet
            }) {
-            recoveryJournalBytes -= recoveryJournal[index].envelope.payload.count
-            recoveryJournal[index].envelope = envelope
-            recoveryJournal[index].recipients.formUnion(recipientSet)
-            recoveryJournal[index].createdAt = Date()
-            recoveryJournalBytes += envelope.payload.count
-            trimRecoveryJournalIfNeeded()
-            return
+            recoveryJournalBytes -= recoveryJournal.remove(at: index).envelope.payload.count
         }
 
         recoveryJournal.append(JournalEntry(
@@ -151,10 +144,13 @@ public final class RoomOutbox {
 
     private func pruneRecoveryJournal() {
         let cutoff = Date().addingTimeInterval(-P2PLimits.recoveryJournalRetention)
-        recoveryJournal.removeAll { $0.createdAt < cutoff }
-        recoveryJournalBytes = recoveryJournal.reduce(into: 0) { total, entry in
-            total += entry.envelope.payload.count
+        var bytes = 0
+        recoveryJournal.removeAll { entry in
+            if entry.createdAt < cutoff { return true }
+            bytes += entry.envelope.payload.count
+            return false
         }
+        recoveryJournalBytes = bytes
     }
 
     private func trimRecoveryJournalIfNeeded() {

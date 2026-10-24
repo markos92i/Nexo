@@ -48,12 +48,6 @@ public enum RoomAccessPolicy: String, Codable, Sendable, CaseIterable {
     /// The host must approve every join request.
     case approval
 
-    public var localizedTitle: String {
-        switch self {
-        case .open: "Abierta"
-        case .approval: "Con aprobación"
-        }
-    }
 }
 
 // MARK: - RoomFeatures
@@ -195,9 +189,9 @@ public enum RoomAccessState: Equatable, Sendable {
     /// Retrying to recover membership.
     case reconnecting
     /// The host rejected entry or removed the member.
-    case rejected(reason: String)
+    case rejected(reason: NexoReason)
     /// The room closed or the host disappeared.
-    case closed(reason: String)
+    case closed(reason: NexoReason)
 
     public var isUsable: Bool { self == .joined }
 }
@@ -213,6 +207,8 @@ public struct RoomJoinRequest: Identifiable, Sendable, Equatable {
     public let displayName: String
     public let avatar: String?
     public let receivedAt: Date
+    public let requestID: UUID?
+    public let connectionSessionID: UUID?
 
     public init(
         id: UUID = UUID(),
@@ -220,7 +216,9 @@ public struct RoomJoinRequest: Identifiable, Sendable, Equatable {
         applicationID: String,
         displayName: String,
         avatar: String? = nil,
-        receivedAt: Date = Date()
+        receivedAt: Date = Date(),
+        requestID: UUID? = nil,
+        connectionSessionID: UUID? = nil
     ) {
         self.id = id
         self.roomID = roomID
@@ -228,6 +226,8 @@ public struct RoomJoinRequest: Identifiable, Sendable, Equatable {
         self.displayName = displayName
         self.avatar = avatar
         self.receivedAt = receivedAt
+        self.requestID = requestID
+        self.connectionSessionID = connectionSessionID
     }
 }
 

@@ -9,7 +9,7 @@ import Foundation
 
 public enum ChatMessageKind: String, Codable, Sendable {
     case text
-    /// Locally generated notice (joins, leaves, room closed).
+    /// App-only display notice; never accepted into room chat history.
     case systemInfo
     /// Message with an attachment. Content arrives over the transfer channel.
     case attachment
@@ -95,18 +95,6 @@ public struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
     public var isSystem: Bool { kind == .systemInfo }
 
     public static func == (lhs: ChatMessage, rhs: ChatMessage) -> Bool { lhs.id == rhs.id }
-
-    // MARK: Factories
-
-    public static func system(roomID: RoomID, body: String) -> ChatMessage {
-        ChatMessage(
-            roomID: roomID,
-            senderApplicationID: "system",
-            senderDisplayName: "Sistema",
-            body: body,
-            kind: .systemInfo
-        )
-    }
 }
 
 // MARK: - ChatRoomSession
@@ -115,8 +103,7 @@ public struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
 ///
 /// Only exists if the room declares `RoomFeatures.chat`, so a game-only room
 /// carries no chat history or UI.
-@MainActor
-@Observable
+@NexoActor
 public final class ChatRoomSession {
 
     public let roomID: RoomID
@@ -127,8 +114,13 @@ public final class ChatRoomSession {
     /// Live transfers associated with this chat's messages.
     public private(set) var transfers: [UUID: FileTransferState] = [:]
 
+    private let membership: RoomMembership
     private let outbox: RoomOutbox
     private let identity: LocalP2PIdentity
+    /// Called after any visible change so the owning room can republish its
+    /// snapshot. The chat has no stream of its own: messages travel over the
+    /// transfer and chat channels and the room already aggregates both.
+    var onChange: (@NexoActor () -> Void)?
     /// IDs already seen: the same message can arrive again via replay. Kept
     /// independently of the visible window so an old replay never reinserts a
     /// message already dropped from `messages`. IDs no longer visible are kept
@@ -138,8 +130,18 @@ public final class ChatRoomSession {
 
     // MARK: - Init
 
-    public init(roomID: RoomID, outbox: RoomOutbox, identity: LocalP2PIdentity) {
+    public convenience init(
+        roomID: RoomID,
+        outbox: RoomOutbox,
+        identity: LocalP2PIdentity,
+        members: [RoomMember] = []
+    ) {
+        self.init(roomID: roomID, outbox: outbox, identity: identity, membership: RoomMembership(members: members))
+    }
+
+    init(roomID: RoomID, outbox: RoomOutbox, identity: LocalP2PIdentity, membership: RoomMembership) {
         self.roomID = roomID
+        self.membership = membership
         self.outbox = outbox
         self.identity = identity
     }
@@ -167,7 +169,11 @@ public final class ChatRoomSession {
         )
 
         append(message)
-        outbox.send(message, channel: .chat)
+        let recipients = membership.members
+            .filter { $0.applicationID != identity.applicationID }
+            .map(\.applicationID)
+        outbox.send(message, channel: .chat, to: recipients)
+        onChange?()
     }
 
     /// Publishes the message that accompanies an attachment. Content is
@@ -182,9 +188,14 @@ public final class ChatRoomSession {
             attachment: attachment
         )
 
-        append(message)
-        transfers[attachment.transferID] = .accepted
-        outbox.send(message, channel: .chat)
+        if append(message), transfers[attachment.transferID] == nil {
+            transfers[attachment.transferID] = .accepted
+        }
+        let recipients = membership.members
+            .filter { $0.applicationID != identity.applicationID }
+            .map(\.applicationID)
+        outbox.send(message, channel: .chat, to: recipients)
+        onChange?()
     }
 
     // MARK: - Receiving
@@ -193,9 +204,10 @@ public final class ChatRoomSession {
         guard var message = try? P2PCoder.decode(ChatMessage.self, from: payload) else { return }
 
         // The declared sender must match the peer known to the room, and the
-        // message must belong to this room.
+        // message must belong to this room. System notices are local display only.
         guard message.senderApplicationID == member.applicationID,
-              message.roomID == roomID else { return }
+              message.roomID == roomID,
+              message.kind != .systemInfo else { return }
 
         // A plain message can't carry attachment metadata, and an attachment
         // message must declare its offer. An invitation and an attachment
@@ -216,11 +228,12 @@ public final class ChatRoomSession {
         // embedded in the payload.
         message.senderDisplayName = member.displayName
         message.body = String(message.body.prefix(4_000))
-        append(message)
+        guard append(message) else { return }
 
-        if let attachment = message.attachment {
+        if let attachment = message.attachment, transfers[attachment.transferID] == nil {
             transfers[attachment.transferID] = .offered
         }
+        onChange?()
     }
 
     /// Merges history sent by the host during resume. UUID deduplication
@@ -239,42 +252,20 @@ public final class ChatRoomSession {
             guard append(message) else { continue }
             didChange = true
 
-            if let attachment = message.attachment {
+            if let attachment = message.attachment, transfers[attachment.transferID] == nil {
                 transfers[attachment.transferID] = .offered
             }
         }
 
+        if didChange { onChange?() }
         return didChange
-    }
-
-    // MARK: - System messages & presence
-
-    public func appendSystemMessage(_ body: String) {
-        append(.system(roomID: roomID, body: body))
-    }
-
-    public func memberDidJoin(_ member: RoomMember) {
-        if member.applicationID == identity.applicationID {
-            appendSystemMessage("Te has unido.")
-        } else {
-            appendSystemMessage("\(member.displayName) se ha unido.")
-        }
-    }
-
-    public func memberDidLeave(_ member: RoomMember) {
-        appendSystemMessage("\(member.displayName) ha salido.")
     }
 
     // MARK: - Transfers
 
     public func updateTransfer(_ transferID: UUID, state: FileTransferState) {
         transfers[transferID] = state
-
-        guard case .failed(let reason) = state,
-              let index = messages.firstIndex(where: { $0.attachment?.transferID == transferID })
-        else { return }
-
-        messages[index].body = "No se pudo transferir: \(reason)"
+        onChange?()
     }
 
     public func transferState(for transferID: UUID) -> FileTransferState? {
@@ -286,6 +277,7 @@ public final class ChatRoomSession {
         seenMessageIDs.removeAll()
         seenMessageDates.removeAll()
         transfers.removeAll()
+        onChange?()
     }
 
     // MARK: - Private Helpers
@@ -295,16 +287,16 @@ public final class ChatRoomSession {
         pruneSeenMessageIDs()
         guard seenMessageIDs.insert(message.id).inserted else { return false }
         seenMessageDates[message.id] = Date()
-        messages.append(message)
-        messages.sort { lhs, rhs in
-            if lhs.timestamp != rhs.timestamp {
-                return lhs.timestamp < rhs.timestamp
-            }
-            return lhs.id.uuidString < rhs.id.uuidString
-        }
+        let index = messages.firstIndex {
+            $0.timestamp > message.timestamp
+                || ($0.timestamp == message.timestamp && $0.id.uuidString > message.id.uuidString)
+        } ?? messages.endIndex
+        messages.insert(message, at: index)
 
         if messages.count > P2PLimits.chatHistoryLimit {
             messages.removeFirst(messages.count - P2PLimits.chatHistoryLimit)
+            let visibleTransfers = Set(messages.compactMap(\.attachment?.transferID))
+            transfers = transfers.filter { visibleTransfers.contains($0.key) }
         }
         pruneSeenMessageIDs()
         return true

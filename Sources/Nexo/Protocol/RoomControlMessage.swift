@@ -45,6 +45,26 @@ public enum RoomControlMessage: Codable, Sendable {
     case activityJoinRejected(ActivityRejectionPayload)
     case activityLeft(ActivityMembershipPayload)
     case activityEnded(ActivityEndedPayload)
+
+    var roomID: RoomID? {
+        switch self {
+        case .roomDirectory, .roomDirectoryRequest: nil
+        case .joinRoomRequest(let payload): payload.roomID
+        case .joinRoomAccepted(let payload): payload.descriptor.id
+        case .joinRoomRejected(let payload): payload.roomID
+        case .leaveRoom(let payload): payload.roomID
+        case .roomMembershipChanged(let payload): payload.descriptor.id
+        case .roomResume(let payload): payload.descriptor.id
+        case .roomHostChanged(let payload): payload.descriptor.id
+        case .chatHistory(let payload): payload.roomID
+        case .roomClosed(let payload): payload.roomID
+        case .activityStarted(let payload), .activityInvite(let payload),
+             .activityJoinAccepted(let payload): payload.descriptor.roomID
+        case .activityJoinRequest(let payload), .activityLeft(let payload): payload.roomID
+        case .activityJoinRejected(let payload): payload.roomID
+        case .activityEnded(let payload): payload.roomID
+        }
+    }
 }
 
 // MARK: - Directory Payloads
@@ -60,11 +80,14 @@ public struct JoinRoomRequestPayload: Codable, Sendable {
     public let roomID: RoomID
     public let displayName: String
     public let avatar: String?
+    /// Echoed by the host; a reply must never complete a later join attempt.
+    public let requestID: UUID?
 
-    public init(roomID: RoomID, displayName: String, avatar: String? = nil) {
+    public init(roomID: RoomID, displayName: String, avatar: String? = nil, requestID: UUID? = nil) {
         self.roomID = roomID
         self.displayName = displayName
         self.avatar = avatar
+        self.requestID = requestID
     }
 }
 
@@ -74,11 +97,31 @@ public struct JoinRoomAcceptedPayload: Codable, Sendable {
     /// Activities already live in the room, so the newcomer can join or at
     /// least see them.
     public let activities: [ActivityDescriptor]
+    public let requestID: UUID?
+
+    public init(
+        descriptor: RoomDescriptor,
+        members: [RoomMember],
+        activities: [ActivityDescriptor],
+        requestID: UUID? = nil
+    ) {
+        self.descriptor = descriptor
+        self.members = members
+        self.activities = activities
+        self.requestID = requestID
+    }
 }
 
 public struct JoinRoomRejectedPayload: Codable, Sendable {
     public let roomID: RoomID
-    public let reason: String
+    public let reason: NexoReason
+    public let requestID: UUID?
+
+    public init(roomID: RoomID, reason: NexoReason, requestID: UUID? = nil) {
+        self.roomID = roomID
+        self.reason = reason
+        self.requestID = requestID
+    }
 }
 
 public struct LeaveRoomPayload: Codable, Sendable {
@@ -132,7 +175,7 @@ public struct ChatHistoryPayload: Codable, Sendable {
 
 public struct RoomClosedPayload: Codable, Sendable {
     public let roomID: RoomID
-    public let reason: String
+    public let reason: NexoReason
 }
 
 // MARK: - Activity Payloads
@@ -150,57 +193,29 @@ public struct ActivityMembershipPayload: Codable, Sendable {
 public struct ActivityRejectionPayload: Codable, Sendable {
     public let roomID: RoomID
     public let activityID: ActivityID
-    public let reason: String
+    public let reason: NexoReason
 }
 
 public struct ActivityEndedPayload: Codable, Sendable {
     public let roomID: RoomID
     public let activityID: ActivityID
-    public let reason: String
+    public let reason: NexoReason
 }
 
 // MARK: - Errors
 
-public enum RoomError: Error, LocalizedError, Sendable, Equatable {
+public enum RoomError: Error, Sendable, Equatable {
     case roomNotFound
     case roomFull
     case notAMember
     case notHost
-    case featureUnavailable(String)
+    case featureUnavailable(RoomFeatures)
+    case activityUnsupported(ActivityKind)
     case peerUnavailable
-    case joinRejected(String)
+    case joinRejected(NexoReason)
     case joinTimedOut
     case activityNotFound
     case activityAlreadyRunning
     case incompatibleProtocol(UInt8)
-    case transportFailure(String)
-
-    public var errorDescription: String? {
-        switch self {
-        case .roomNotFound:
-            "La sala ya no está disponible."
-        case .roomFull:
-            "La sala está completa."
-        case .notAMember:
-            "No perteneces a esta sala."
-        case .notHost:
-            "Solo el anfitrión puede hacer esto."
-        case .featureUnavailable(let feature):
-            "Esta sala no admite \(feature)."
-        case .peerUnavailable:
-            "No se ha podido contactar con el dispositivo."
-        case .joinRejected(let reason):
-            reason
-        case .joinTimedOut:
-            "El anfitrión no ha respondido a tiempo."
-        case .activityNotFound:
-            "La partida ya no está activa."
-        case .activityAlreadyRunning:
-            "Ya hay una partida en curso en esta sala."
-        case .incompatibleProtocol(let version):
-            "La versión del protocolo del otro dispositivo (\(version)) no es compatible."
-        case .transportFailure(let reason):
-            reason
-        }
-    }
+    case transportFailure(NexoReason)
 }

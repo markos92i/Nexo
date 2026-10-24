@@ -27,8 +27,7 @@ import Testing
     let guidance = NexoPermissionsGuidance(localNetworkState: .denied)
     
     #expect(guidance.needsUserAction == true)
-    #expect(guidance.title == "Red local deshabilitada")
-    #expect(guidance.steps.isEmpty == false)
+    #expect(guidance.localNetworkState == .denied)
     #expect(guidance.canOpenSettings == true)
 }
 
@@ -36,18 +35,17 @@ import Testing
     let guidance = NexoPermissionsGuidance(localNetworkState: .granted)
     
     #expect(guidance.needsUserAction == false)
-    #expect(guidance.title == "Listo para conectar")
-    #expect(guidance.steps.isEmpty == true)
+    #expect(guidance.localNetworkState == .granted)
 }
 
 @Test func permissionsGuidanceForUnknown() {
     let guidance = NexoPermissionsGuidance(localNetworkState: .unknown)
     
     #expect(guidance.needsUserAction == false)
-    #expect(guidance.title == "Verificando permisos")
+    #expect(guidance.localNetworkState == .unknown)
 }
 
-@Test @MainActor func permissionsStatusComputedProperties() {
+@Test @NexoActor func permissionsStatusComputedProperties() {
     let status = NexoPermissionsStatus()
     
     // Estado inicial

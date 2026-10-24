@@ -38,7 +38,7 @@ public struct P2PFrame: Codable, Sendable {
         P2PFrame(kind: .envelope, envelope: envelope)
     }
 
-    public static func goodbye(reason: String) -> P2PFrame {
+    public static func goodbye(reason: NexoReason) -> P2PFrame {
         P2PFrame(kind: .goodbye, goodbye: GoodbyeBody(reason: reason))
     }
 }
@@ -77,6 +77,6 @@ public struct HelloBody: Codable, Sendable {
 
 // MARK: - GoodbyeBody
 
-public struct GoodbyeBody: Codable, Sendable {
-    public let reason: String
+public struct GoodbyeBody: Codable, Sendable, Equatable {
+    public let reason: NexoReason
 }

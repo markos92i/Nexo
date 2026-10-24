@@ -6,6 +6,7 @@
 import Foundation
 import CryptoKit
 import OSLog
+import Security
 
 // MARK: - NexoPeerVerificationState
 
@@ -72,6 +73,7 @@ public enum NexoFingerprintFormatter {
     public static func format(_ fingerprint: String, groupSize: Int = 4, separator: String = " ") -> String {
         var result = ""
         var count = 0
+        let groupSize = max(1, groupSize)
         for char in fingerprint.uppercased() {
             if count > 0 && count % groupSize == 0 {
                 result += separator
@@ -180,8 +182,7 @@ public enum NexoFingerprintFormatter {
 ///
 /// For stronger security, users can verify fingerprints out of band
 /// (comparing emojis in person, scanning a QR, etc.) and mark the peer as "verified".
-@MainActor
-@Observable
+@NexoActor
 public final class NexoPeerVerificationService {
     
     private static let logger = Logger(subsystem: "com.zafir.nexo", category: "verification")
@@ -237,6 +238,9 @@ public final class NexoPeerVerificationService {
             return false
         }
         
+        if let record = trustStore.record(for: peer.applicationID) {
+            return NexoFingerprintFormatter.compare(record.fingerprint, fingerprint)
+        }
         return trustStore.trust(
             applicationID: peer.applicationID,
             displayName: peer.displayName,
@@ -248,7 +252,9 @@ public final class NexoPeerVerificationService {
     /// Marks a peer as verified (the user confirmed the fingerprint out of band).
     @discardableResult
     public func markAsVerified(_ peer: ConnectedPeer) -> Bool {
-        guard peer.certificateFingerprint != nil else { return false }
+        guard let fingerprint = peer.certificateFingerprint,
+              let record = trustStore.record(for: peer.applicationID),
+              NexoFingerprintFormatter.compare(record.fingerprint, fingerprint) else { return false }
         return trustStore.markAsVerified(peer.applicationID)
     }
     
@@ -259,16 +265,15 @@ public final class NexoPeerVerificationService {
     public func acceptIdentityChange(_ peer: ConnectedPeer) -> Bool {
         guard let fingerprint = peer.certificateFingerprint else { return false }
         
-        Self.logger.info("User accepted identity change for \(peer.applicationID)")
-        identityChangedPeers.remove(peer.applicationID)
-        
-        trustStore.revoke(peer.applicationID)
-        return trustStore.trust(
+        guard trustStore.trust(
             applicationID: peer.applicationID,
             displayName: peer.displayName,
             fingerprint: fingerprint,
             isVerified: false
-        )
+        ) else { return false }
+        Self.logger.info("User accepted identity change for \(peer.applicationID)")
+        identityChangedPeers.remove(peer.applicationID)
+        return true
     }
     
     /// Revokes trust in a peer.
@@ -321,7 +326,7 @@ public struct NexoTrustRecord: Codable, Sendable, Identifiable {
 // MARK: - NexoEnhancedTrustStore
 
 /// Enhanced store of trusted peers with additional metadata.
-@MainActor
+@NexoActor
 public final class NexoEnhancedTrustStore {
     
     private static let service = "com.zafir.nexo.peer-trust-v2"
@@ -359,13 +364,18 @@ public final class NexoEnhancedTrustStore {
             lastSeenAt: now,
             lastVerifiedAt: isVerified ? now : nil
         )
-        records[applicationID] = record
-        return save()
+        let previous = records.updateValue(record, forKey: applicationID)
+        guard save() else {
+            records[applicationID] = previous
+            return false
+        }
+        return true
     }
     
     @discardableResult
     func markAsVerified(_ applicationID: String) -> Bool {
         guard var record = records[applicationID] else { return false }
+        let previous = record
         record = NexoTrustRecord(
             applicationID: record.applicationID,
             displayName: record.displayName,
@@ -376,19 +386,24 @@ public final class NexoEnhancedTrustStore {
             lastVerifiedAt: Date()
         )
         records[applicationID] = record
-        return save()
+        guard save() else {
+            records[applicationID] = previous
+            return false
+        }
+        return true
     }
     
     func updateLastSeen(for applicationID: String) {
         guard var record = records[applicationID] else { return }
+        let previous = record
         record.lastSeenAt = Date()
         records[applicationID] = record
-        save()
+        if !save() { records[applicationID] = previous }
     }
     
     func revoke(_ applicationID: String) {
-        records.removeValue(forKey: applicationID)
-        save()
+        let previous = records.removeValue(forKey: applicationID)
+        if !save() { records[applicationID] = previous }
     }
     
     // MARK: - Persistence
@@ -410,7 +425,13 @@ public final class NexoEnhancedTrustStore {
             return [:]
         }
         
-        return Dictionary(uniqueKeysWithValues: records.map { ($0.applicationID, $0) })
+        var index: [String: NexoTrustRecord] = [:]
+        for record in records {
+            // Corrupt duplicate entries must never crash or silently select a trusted key.
+            guard index[record.applicationID] == nil else { return [:] }
+            index[record.applicationID] = record
+        }
+        return index
     }
     
     @discardableResult

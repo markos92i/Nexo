@@ -61,6 +61,9 @@ public struct NexoByteStream: AsyncSequence, Sendable {
     /// cancellation is propagated when the consumer stops iterating.
     public final class Source: @unchecked Sendable {
         private let continuation: AsyncThrowingStream<Data, Error>.Continuation
+        // Serialize yield/finish so a racing finish cannot hide overflow. Recursive
+        // because AsyncStream can invoke a client's termination handler inline.
+        private let lock = NSRecursiveLock()
 
         fileprivate init(continuation: AsyncThrowingStream<Data, Error>.Continuation) {
             self.continuation = continuation
@@ -68,20 +71,39 @@ public struct NexoByteStream: AsyncSequence, Sendable {
 
         @discardableResult
         public func yield(_ data: Data) -> AsyncThrowingStream<Data, Error>.Continuation.YieldResult {
-            continuation.yield(data)
+            lock.lock()
+            defer { lock.unlock() }
+            let result = continuation.yield(data)
+            // Existing synchronous producers cannot suspend; loss must fail closed.
+            if case .dropped = result {
+                continuation.finish(throwing: FileTransferError.bufferOverflow)
+            }
+            return result
         }
 
         public func finish() {
+            lock.lock()
+            defer { lock.unlock() }
             continuation.finish()
         }
 
         public func finish(throwing error: any Error) {
+            lock.lock()
+            defer { lock.unlock() }
             continuation.finish(throwing: error)
         }
 
         public var onTermination: (@Sendable (AsyncThrowingStream<Data, Error>.Continuation.Termination) -> Void)? {
-            get { continuation.onTermination }
-            set { continuation.onTermination = newValue }
+            get {
+                lock.lock()
+                defer { lock.unlock() }
+                return continuation.onTermination
+            }
+            set {
+                lock.lock()
+                defer { lock.unlock() }
+                continuation.onTermination = newValue
+            }
         }
     }
 }
@@ -110,20 +132,11 @@ public struct NexoBinaryFrame: Sendable, Equatable {
     }
 }
 
-public enum NexoBinaryFrameError: Error, LocalizedError, Sendable, Equatable {
+public enum NexoBinaryFrameError: Error, Sendable, Equatable {
     case truncated
     case invalidLength
     case invalidKind(UInt8)
     case oversized(Int)
-
-    public var errorDescription: String? {
-        switch self {
-        case .truncated: "El frame binario está incompleto."
-        case .invalidLength: "La longitud del frame binario no es válida."
-        case .invalidKind(let kind): "Tipo de frame binario desconocido: \(kind)."
-        case .oversized(let bytes): "El frame binario ocupa \(bytes) bytes y supera el límite."
-        }
-    }
 }
 
 // MARK: - NexoBinaryFrameCodec
@@ -191,9 +204,11 @@ public actor NexoBinaryStreamChannel {
 
     public func openIncoming(_ descriptor: NexoStreamDescriptor) -> NexoByteStream {
         let pair = NexoByteStream.makeStream()
+        sources.removeValue(forKey: descriptor.id)?.finish(throwing: FileTransferError.cancelled)
         sources[descriptor.id] = pair.source
-        pair.source.onTermination = { [weak self] _ in
-            Task { await self?.remove(descriptor.id) }
+        pair.source.onTermination = { [weak self, weak source = pair.source] _ in
+            guard let source else { return }
+            Task { await self?.remove(descriptor.id, source: source) }
         }
         return pair.stream
     }
@@ -205,7 +220,14 @@ public actor NexoBinaryStreamChannel {
         case .open:
             break
         case .data:
-            _ = source.yield(frame.payload)
+            switch source.yield(frame.payload) {
+            case .enqueued: break
+            case .dropped, .terminated:
+                sources.removeValue(forKey: frame.streamID)
+            @unknown default:
+                source.finish(throwing: FileTransferError.bufferOverflow)
+                sources.removeValue(forKey: frame.streamID)
+            }
         case .finish:
             source.finish()
             sources.removeValue(forKey: frame.streamID)
@@ -221,8 +243,15 @@ public actor NexoBinaryStreamChannel {
         sources.removeValue(forKey: streamID)?.finish(throwing: FileTransferError.cancelled)
     }
 
-    private func remove(_ streamID: UUID) {
+    private func remove(_ streamID: UUID, source: NexoByteStream.Source) {
+        guard sources[streamID] === source else { return }
         sources.removeValue(forKey: streamID)
+    }
+
+    deinit {
+        for source in sources.values {
+            source.finish(throwing: FileTransferError.cancelled)
+        }
     }
 }
 
@@ -235,40 +264,38 @@ public enum NexoBinaryStreamFrames {
         descriptor: NexoStreamDescriptor,
         from stream: NexoByteStream
     ) -> AsyncThrowingStream<NexoBinaryFrame, Error> {
-        let pair = AsyncThrowingStream<NexoBinaryFrame, Error>.makeStream()
+        let pair = AsyncThrowingStream<NexoBinaryFrame, Error>.makeStream(bufferingPolicy: .bufferingOldest(8))
 
-        Task {
+        let task = Task {
             do {
                 let metadata = try JSONEncoder().encode(descriptor)
-                pair.continuation.yield(NexoBinaryFrame(
-                    kind: .open,
-                    streamID: descriptor.id,
-                    payload: metadata
-                ))
-
+                try yield(NexoBinaryFrame(kind: .open, streamID: descriptor.id, payload: metadata), to: pair.continuation)
                 for try await chunk in stream {
-                    pair.continuation.yield(NexoBinaryFrame(
-                        kind: .data,
-                        streamID: descriptor.id,
-                        payload: chunk
-                    ))
+                    try Task.checkCancellation()
+                    try yield(NexoBinaryFrame(kind: .data, streamID: descriptor.id, payload: chunk), to: pair.continuation)
                 }
-
-                pair.continuation.yield(NexoBinaryFrame(
-                    kind: .finish,
-                    streamID: descriptor.id
-                ))
+                try Task.checkCancellation()
+                try yield(NexoBinaryFrame(kind: .finish, streamID: descriptor.id), to: pair.continuation)
                 pair.continuation.finish()
             } catch {
-                pair.continuation.yield(NexoBinaryFrame(
-                    kind: .cancel,
-                    streamID: descriptor.id
-                ))
+                try? yield(NexoBinaryFrame(kind: .cancel, streamID: descriptor.id), to: pair.continuation)
                 pair.continuation.finish(throwing: error)
             }
         }
-
+        pair.continuation.onTermination = { _ in task.cancel() }
         return pair.stream
+    }
+
+    private static func yield(
+        _ frame: NexoBinaryFrame,
+        to continuation: AsyncThrowingStream<NexoBinaryFrame, Error>.Continuation
+    ) throws(FileTransferError) {
+        switch continuation.yield(frame) {
+        case .enqueued: break
+        case .dropped: throw .bufferOverflow
+        case .terminated: throw .cancelled
+        @unknown default: throw .bufferOverflow
+        }
     }
 }
 

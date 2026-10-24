@@ -32,5 +32,5 @@ public struct P2PActivityInvitationNotice: Sendable, Equatable {
 
 public struct P2PRoomClosedNotice: Sendable, Equatable {
     public let roomID: RoomID
-    public let reason: String
+    public let reason: NexoReason
 }

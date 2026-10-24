@@ -11,10 +11,9 @@ import Foundation
 /// framework. Negotiated during the handshake, before any envelope is admitted.
 public enum P2PProtocolInfo {
 
-    /// Host migration is part of this version's wire format, so it is not
-    /// advertised as compatible with older peers.
-    public static let currentVersion: UInt8 = 4
-    public static let minimumVersion: UInt8 = 4
+    // Session-bound authentication and correlated joins require both peers to agree.
+    public static let currentVersion: UInt8 = 6
+    public static let minimumVersion: UInt8 = 6
 
     /// Capabilities advertised in `hello`. Lets new features roll out without
     /// breaking older peers: unsupported capabilities are simply not used with them.

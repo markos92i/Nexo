@@ -54,25 +54,34 @@ import CryptoKit
 
 // MARK: - Local TLS Identity Error Tests
 
-@Test func localTLSIdentityErrorDescriptions() {
+@Test func localTLSIdentityErrorsRemainPresentationIndependent() {
     let errors: [NexoLocalTLSIdentityError] = [
         .incompleteKeychainState,
-        .keyGenerationFailed("test reason"),
+        .keyGenerationFailed(.system(domain: "test", code: 42)),
         .certificateStorageFailed(42),
         .identityCreationFailed,
         .keyCertificateMismatch
     ]
-    
+
     for error in errors {
-        // Every error must have a non-empty description
-        #expect(error.errorDescription?.isEmpty == false)
+        let underlying: any Error = error
+        #expect(!(underlying is any LocalizedError))
     }
 }
 
-@Test func localTLSIdentityErrorMessages() {
-    let error1 = NexoLocalTLSIdentityError.keyGenerationFailed("test reason")
-    #expect(error1.errorDescription?.contains("test reason") == true)
-    
+@Test func localTLSIdentityErrorDetails() {
+    let reason = NexoReason.system(domain: "test", code: 42)
+    let error1 = NexoLocalTLSIdentityError.keyGenerationFailed(reason)
+    if case .keyGenerationFailed(let underlying) = error1 {
+        #expect(underlying == reason)
+    } else {
+        Issue.record("Expected key generation failure")
+    }
+
     let error2 = NexoLocalTLSIdentityError.certificateStorageFailed(-25300)
-    #expect(error2.errorDescription?.contains("-25300") == true)
+    if case .certificateStorageFailed(let status) = error2 {
+        #expect(status == -25300)
+    } else {
+        Issue.record("Expected certificate storage failure")
+    }
 }

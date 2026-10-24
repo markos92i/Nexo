@@ -38,8 +38,7 @@ public enum NexoPermissionKind: String, Sendable, CaseIterable {
 // MARK: - NexoPermissionsStatus
 
 /// Aggregated state of all permissions needed for P2P.
-@MainActor
-@Observable
+@NexoActor
 public final class NexoPermissionsStatus {
     /// Local network permission state.
     public private(set) var localNetwork: NexoPermissionState = .unknown
@@ -53,7 +52,7 @@ public final class NexoPermissionsStatus {
     public var hasCriticalDenial: Bool {
         localNetwork == .denied || localNetwork == .restricted
     }
-    
+
     fileprivate func update(localNetwork: NexoPermissionState) {
         self.localNetwork = localNetwork
         self.lastChecked = Date()
@@ -68,29 +67,29 @@ public final class NexoPermissionsStatus {
 /// uses Bonjour or connects to devices on the local network. This checker
 /// verifies proactively, detects user denial, and provides guidance for
 /// re-enabling the permission in Settings.
-@MainActor
+@NexoActor
 public final class NexoPermissionsChecker {
-    
+
     private static let logger = Logger(subsystem: "com.zafir.nexo", category: "permissions")
-    
+
     /// Observable permission state.
     public let status = NexoPermissionsStatus()
-    
+
     /// Callback fired when permission state changes.
-    public var onPermissionChange: (@MainActor @Sendable (NexoPermissionKind, NexoPermissionState) -> Void)?
-    
+    public var onPermissionChange: (@NexoActor @Sendable (NexoPermissionKind, NexoPermissionState) -> Void)?
+
     private var checkTask: Task<Void, Never>?
     private var monitorTask: Task<Void, Never>?
-    
+
     public init() {}
-    
+
     deinit {
         checkTask?.cancel()
         monitorTask?.cancel()
     }
-    
+
     // MARK: - Public API
-    
+
     /// Checks the current state of all required permissions.
     ///
     /// Performs a minimal probe connection to determine whether local network
@@ -98,45 +97,45 @@ public final class NexoPermissionsChecker {
     /// on first use.
     public func checkPermissions() async {
         checkTask?.cancel()
-        checkTask = Task { @MainActor in
+        checkTask = Task { @NexoActor in
             await checkLocalNetworkPermission()
         }
         await checkTask?.value
     }
-    
+
     /// Checks only the local network permission.
     public func checkLocalNetworkPermission() async {
         let state = await LocalNetworkProber.probe()
         let previousState = status.localNetwork
         status.update(localNetwork: state)
-        
+
         if state != previousState {
             Self.logger.info("Local network permission changed: \(previousState.rawValue) → \(state.rawValue)")
             onPermissionChange?(.localNetwork, state)
         }
     }
-    
+
     /// Starts continuous monitoring of permission state.
     ///
     /// Detects when the user changes permissions in Settings while the app
     /// is in the foreground.
     public func startMonitoring(interval: TimeInterval = 5.0) {
         stopMonitoring()
-        
-        monitorTask = Task { @MainActor [weak self] in
+
+        monitorTask = Task { @NexoActor [weak self] in
             while !Task.isCancelled {
                 await self?.checkLocalNetworkPermission()
                 try? await Task.sleep(for: .seconds(interval))
             }
         }
     }
-    
+
     /// Stops continuous monitoring.
     public func stopMonitoring() {
         monitorTask?.cancel()
         monitorTask = nil
     }
-    
+
     /// Guidance to help the user enable permissions.
     public var settingsGuidance: NexoPermissionsGuidance {
         NexoPermissionsGuidance(localNetworkState: status.localNetwork)
@@ -147,7 +146,7 @@ public final class NexoPermissionsChecker {
 
 /// Isolated probing to avoid concurrency issues with NWBrowser callbacks.
 private actor LocalNetworkProber {
-    
+
     /// Attempts a minimal network operation to check the permission.
     ///
     /// iOS provides no direct API for local network permission status; the
@@ -158,18 +157,18 @@ private actor LocalNetworkProber {
                 for: .bonjour(type: "_nexo-probe._tcp", domain: nil),
                 using: NWParameters()
             )
-            
+
             // Actor-owned state guards against resuming the continuation twice
             let state = ProbeState()
-            
+
             browser.stateUpdateHandler = { browserState in
                 Task {
                     await state.handleBrowserState(browserState, browser: browser, continuation: continuation)
                 }
             }
-            
+
             browser.start(queue: .global())
-            
+
             // Timeout: if no response within 3 seconds, assume granted
             Task {
                 try? await Task.sleep(for: .seconds(3))
@@ -182,7 +181,7 @@ private actor LocalNetworkProber {
 /// Probe state handled in a thread-safe way.
 private actor ProbeState {
     private var hasResumed = false
-    
+
     func handleBrowserState(
         _ state: NWBrowser.State,
         browser: NWBrowser,
@@ -191,19 +190,19 @@ private actor ProbeState {
         switch state {
         case .ready:
             resumeIfNeeded(with: .granted, browser: browser, continuation: continuation)
-            
+
         case .failed(let error):
             let permissionState = isPermissionDeniedError(error) ? NexoPermissionState.denied : .granted
             resumeIfNeeded(with: permissionState, browser: browser, continuation: continuation)
-            
+
         case .cancelled, .setup, .waiting:
             break
-            
+
         @unknown default:
             break
         }
     }
-    
+
     func resumeIfNeeded(
         with result: NexoPermissionState,
         browser: NWBrowser,
@@ -214,7 +213,7 @@ private actor ProbeState {
         browser.cancel()
         continuation.resume(returning: result)
     }
-    
+
     private func isPermissionDeniedError(_ error: NWError) -> Bool {
         NexoLocalNetworkPermission.isDenied(error)
     }
@@ -224,53 +223,28 @@ private actor ProbeState {
 
 /// Guidance for the user on how to enable permissions.
 public struct NexoPermissionsGuidance: Sendable {
-    
+
     /// Whether user action is needed.
     public let needsUserAction: Bool
-    
-    /// Title shown to the user.
-    public let title: String
-    
-    /// Explaining message.
-    public let message: String
-    
-    /// Steps to enable the permission in Settings.
-    public let steps: [String]
-    
+
     /// Whether Settings can be opened directly.
     public let canOpenSettings: Bool
-    
+
+    /// The permission state this guidance is for.
+    public let localNetworkState: NexoPermissionState
+
     public init(localNetworkState: NexoPermissionState) {
         self.canOpenSettings = true
-        
+        self.localNetworkState = localNetworkState
+
         switch localNetworkState {
-        case .denied:
+        case .denied, .restricted:
             self.needsUserAction = true
-            self.title = "Red local deshabilitada"
-            self.message = "Nexo necesita acceso a la red local para descubrir dispositivos cercanos y comunicarse con ellos."
-            self.steps = [
-                "Abre Ajustes en tu iPhone",
-                "Busca la app en la lista",
-                "Activa \"Red local\""
-            ]
-        case .restricted:
-            self.needsUserAction = true
-            self.title = "Acceso restringido"
-            self.message = "El acceso a la red local está restringido en este dispositivo. Contacta al administrador si es un dispositivo gestionado."
-            self.steps = []
-        case .unknown:
+        case .unknown, .granted, .unsupported:
             self.needsUserAction = false
-            self.title = "Verificando permisos"
-            self.message = "Comprobando el acceso a la red local..."
-            self.steps = []
-        case .granted, .unsupported:
-            self.needsUserAction = false
-            self.title = "Listo para conectar"
-            self.message = "Todos los permisos necesarios están habilitados."
-            self.steps = []
         }
     }
-    
+
     /// URL to open the app's settings (if available).
     public var settingsURL: URL? {
         URL(string: "App-prefs:")
@@ -280,7 +254,7 @@ public struct NexoPermissionsGuidance: Sendable {
 // MARK: - LocalNetworkPermissionState Conversion
 
 public extension LocalNetworkPermissionState {
-    
+
     /// Converts to NexoPermissionState for unified use.
     var asNexoPermissionState: NexoPermissionState {
         switch self {
@@ -295,7 +269,7 @@ public extension LocalNetworkPermissionState {
 }
 
 public extension NexoPermissionState {
-    
+
     /// Converts to LocalNetworkPermissionState for transport compatibility.
     var asLocalNetworkPermissionState: LocalNetworkPermissionState {
         switch self {

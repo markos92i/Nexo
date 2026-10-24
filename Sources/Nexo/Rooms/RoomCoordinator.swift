@@ -5,6 +5,35 @@
 
 import Foundation
 
+// MARK: - RoomsSnapshot
+
+/// Structural snapshot of the room registry: which sessions exist, which
+/// nearby rooms can still be joined and which room is active.
+///
+/// Detail lives in `RoomSession.snapshots`: this only tells a consumer which
+/// sessions to observe and what the room list looks like.
+public struct RoomsSnapshot: Sendable {
+    public let sessionIDs: [RoomID]
+    public let availableRooms: [DiscoveredRoom]
+    public let activeRoomID: RoomID?
+    public let sessionInstances: [RoomID: UUID]
+    public let revision: UInt64
+
+    public init(
+        sessionIDs: [RoomID],
+        availableRooms: [DiscoveredRoom],
+        activeRoomID: RoomID?,
+        sessionInstances: [RoomID: UUID] = [:],
+        revision: UInt64 = 0
+    ) {
+        self.sessionIDs = sessionIDs
+        self.availableRooms = availableRooms
+        self.activeRoomID = activeRoomID
+        self.sessionInstances = sessionInstances
+        self.revision = revision
+    }
+}
+
 // MARK: - RoomCoordinator
 
 /// Logical layer for rooms. Knows nothing about Network framework: talks to
@@ -15,8 +44,7 @@ import Foundation
 /// the membership list, and each member opens a direct connection to whoever
 /// else it can see via Bonjour. No message ever depends on the host relaying
 /// it, and one physical connection serves every room shared with that peer.
-@MainActor
-@Observable
+@NexoActor
 public final class RoomCoordinator {
 
     // MARK: - Observable state
@@ -24,7 +52,7 @@ public final class RoomCoordinator {
     /// Rooms the user belongs to, either as host or guest.
     public private(set) var sessions: [RoomID: RoomSession] = [:]
     /// Rooms advertised by nearby peers, not yet joined.
-    public private(set) var discoveredRooms: [RoomID: DiscoveredRoom] = [:]
+    public var discoveredRooms: [RoomID: DiscoveredRoom] { directory.rooms }
     /// Last room the user interacted with. The first-party UI focuses on one
     /// active room, but the registry supports several.
     public private(set) var activeRoomID: RoomID?
@@ -37,12 +65,22 @@ public final class RoomCoordinator {
 
     // MARK: - Internal state
 
-    private var advertisements: [TransportPeerID: PeerAdvertisement] = [:]
+    private var directory = RoomDirectory()
     private var connectedPeers: [String: ConnectedPeer] = [:]
-    private var joinContinuations: [RoomID: CheckedContinuation<RoomSession, Error>] = [:]
-    private var joinTimeoutTasks: [RoomID: Task<Void, Never>] = [:]
-    /// Senders per room. Chat and activities get theirs through the session;
-    /// the file transfer service asks for it here.
+    private struct PendingJoin {
+        let id: UUID
+        let hostApplicationID: String
+        var continuation: CheckedContinuation<RoomSession, Error>?
+        let isRecovery: Bool
+        var roomToJoin: DiscoveredRoom?
+        var originalSessionInstanceID: UUID?
+        var connectionSessionID: UUID?
+        var sessionInstanceID: UUID?
+        var connectionTask: Task<Void, Never>?
+        var timeoutTask: Task<Void, Never>?
+    }
+    private var pendingJoins: [RoomID: PendingJoin] = [:]
+    /// Senders retained for recovery replay while their rooms are active.
     private var outboxes: [RoomID: RoomOutbox] = [:]
 
     /// A physical drop doesn't immediately change logical membership. Keyed
@@ -53,17 +91,45 @@ public final class RoomCoordinator {
 
     /// Replays keep the same messageID. This registry makes recovery
     /// idempotent for activities that know nothing about the transport.
-    private var receivedEnvelopeIDs: [RoomID: Set<UUID>] = [:]
-    private var receivedEnvelopeOrder: [RoomID: [UUID]] = [:]
+    private struct ReceivedEnvelopeKey: Hashable {
+        let sender: String
+        let messageID: UUID
+    }
+    private var receivedEnvelopeIDs: Set<ReceivedEnvelopeKey> = []
+    private var receivedEnvelopeOrder: [ReceivedEnvelopeKey] = []
+    private let directoryRequestRoomID = RoomID()
 
-    /// Hook for `FileTransferService`, injected by the manager so the
-    /// coordinator isn't coupled to the file transfer service.
-    public var fileTransferHandler: ((RoomEnvelope, RoomMember, RoomSession) -> Void)?
+    public let transfers: FileTransferService
+    private var noticeContinuations: [UUID: AsyncStream<P2PNotice>.Continuation] = [:]
+    private var snapshotContinuations: [UUID: AsyncStream<RoomsSnapshot>.Continuation] = [:]
+    private var revision: UInt64 = 0
 
-    /// Domain notices for app-wide surfaces like a home screen. The
-    /// coordinator doesn't create toasts or know about navigation: it only
-    /// publishes already-validated facts.
-    public var noticeHandler: ((P2PNotice) -> Void)?
+    /// Each consumer owns its subscription; cancelling a view cannot stop others.
+    public var notices: AsyncStream<P2PNotice> {
+        let token = UUID()
+        let pair = AsyncStream.makeStream(of: P2PNotice.self, bufferingPolicy: .bufferingOldest(256))
+        pair.continuation.onTermination = { [weak self] _ in
+            Task { @NexoActor [weak self] in
+                self?.noticeContinuations.removeValue(forKey: token)
+            }
+        }
+        noticeContinuations[token] = pair.continuation
+        return pair.stream
+    }
+
+    /// Each subscription starts with the latest complete structural state.
+    public var snapshots: AsyncStream<RoomsSnapshot> {
+        let token = UUID()
+        let pair = AsyncStream.makeStream(of: RoomsSnapshot.self, bufferingPolicy: .bufferingNewest(1))
+        pair.continuation.onTermination = { [weak self] _ in
+            Task { @NexoActor [weak self] in
+                self?.snapshotContinuations.removeValue(forKey: token)
+            }
+        }
+        snapshotContinuations[token] = pair.continuation
+        pair.continuation.yield(roomsSnapshot())
+        return pair.stream
+    }
 
     // MARK: - Derived
 
@@ -72,9 +138,40 @@ public final class RoomCoordinator {
         return sessions[activeRoomID]
     }
 
+    /// Session for an ID obtained from a snapshot.
+    public func session(_ roomID: RoomID) -> RoomSession? {
+        sessions[roomID]
+    }
+
+    /// Current structural snapshot, for a consumer that subscribes after the
+    /// registry already changed.
+    public func currentRoomsSnapshot() -> RoomsSnapshot {
+        roomsSnapshot()
+    }
+
+    private func roomsSnapshot() -> RoomsSnapshot {
+        RoomsSnapshot(
+            sessionIDs: sessions.keys.sorted { $0.description < $1.description },
+            availableRooms: availableRooms,
+            activeRoomID: activeRoomID,
+            sessionInstances: sessions.mapValues(\.instanceID),
+            revision: revision
+        )
+    }
+
+    private func publishRooms() {
+        revision &+= 1
+        let snapshot = roomsSnapshot()
+        for continuation in snapshotContinuations.values { continuation.yield(snapshot) }
+    }
+
+    private func publishNotice(_ notice: P2PNotice) {
+        for continuation in noticeContinuations.values { continuation.yield(notice) }
+    }
+
     func scheduleHostMigration(for applicationID: String) {
         guard hostMigrationTasks[applicationID] == nil else { return }
-        hostMigrationTasks[applicationID] = Task { @MainActor [weak self] in
+        hostMigrationTasks[applicationID] = Task { @NexoActor [weak self] in
             do {
                 try await Task.sleep(for: P2PLimits.hostMigrationDelay)
             } catch {
@@ -165,7 +262,28 @@ public final class RoomCoordinator {
     ) {
         self.transport = transport
         self.identity = identity
-        self.registry = registry ?? .shared
+        self.registry = registry ?? RoomActivityRegistry()
+        self.transfers = FileTransferService()
+    }
+
+    isolated deinit {
+        for operation in pendingJoins.values {
+            operation.connectionTask?.cancel()
+            operation.timeoutTask?.cancel()
+            operation.continuation?.resume(throwing: CancellationError())
+        }
+        for task in recoveryTasks.values { task.cancel() }
+        for task in hostMigrationTasks.values { task.cancel() }
+        for continuation in noticeContinuations.values { continuation.finish() }
+        for continuation in snapshotContinuations.values { continuation.finish() }
+    }
+
+    public func registerActivity(_ kind: ActivityKind, factory: @escaping RoomActivityRegistry.Factory) {
+        registry.register(kind, factory: factory)
+    }
+
+    public func supportsActivity(_ kind: ActivityKind) -> Bool {
+        registry.isRegistered(kind)
     }
 
     // MARK: - Creating a room
@@ -207,11 +325,12 @@ public final class RoomCoordinator {
         }
 
         let session = makeSession(descriptor: descriptor, accessState: .joined)
-        session.apply(members: [identity.member(role: .host)])
+        apply([identity.member(role: .host)], to: session)
         sessions[descriptor.id] = session
         activeRoomID = descriptor.id
 
         publishAdvertisement()
+        publishRooms()
         return session
     }
 
@@ -223,55 +342,62 @@ public final class RoomCoordinator {
     public func join(_ room: DiscoveredRoom) async throws -> RoomSession {
         if let existing = sessions[room.id], existing.accessState == .joined {
             activeRoomID = room.id
+            publishRooms()
             return existing
         }
 
-        guard let advertisement = advertisements[room.advertisedBy] else {
+        guard pendingJoins[room.id] == nil else {
+            throw RoomError.joinRejected(.duplicateConnection)
+        }
+        if let existing = sessions[room.id] {
+            guard existing.descriptor.hostApplicationID == room.descriptor.hostApplicationID,
+                  existing.descriptor.hostGeneration == room.descriptor.hostGeneration else {
+                throw RoomError.peerUnavailable
+            }
+        }
+        guard let advertisement = directory.advertisements[room.advertisedBy],
+              advertisement.applicationID == room.descriptor.hostApplicationID else {
             throw RoomError.peerUnavailable
         }
-
         guard !room.descriptor.isFull else { throw RoomError.roomFull }
 
-        let host: ConnectedPeer
-        do {
-            host = try await transport.connect(to: advertisement)
-        } catch {
-            throw RoomError.transportFailure(error.localizedDescription)
-        }
-
-        // The peer advertising the room must be its host: only your own
-        // rooms are published in TXT. A mismatch means the advertisement
-        // can't be trusted and the request would be silently lost.
-        guard host.applicationID == room.descriptor.hostApplicationID else {
-            throw RoomError.peerUnavailable
-        }
-
-        guard host.supports(.rooms) else {
-            throw RoomError.incompatibleProtocol(host.protocolVersion)
-        }
-
-        let session = makeSession(descriptor: room.descriptor, accessState: .awaitingApproval)
-        sessions[room.id] = session
-        activeRoomID = room.id
-
+        let requestID = UUID()
+        // Reserve the room before any suspension, including cancellation-handler setup.
+        pendingJoins[room.id] = PendingJoin(
+            id: requestID,
+            hostApplicationID: room.descriptor.hostApplicationID,
+            continuation: nil,
+            isRecovery: false,
+            roomToJoin: room,
+            originalSessionInstanceID: sessions[room.id]?.instanceID
+        )
+        scheduleJoinTimeout(for: room.id, requestID: requestID)
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                joinContinuations[room.id] = continuation
-                scheduleJoinTimeout(for: room.id)
-
-                send(
-                    .joinRoomRequest(JoinRoomRequestPayload(
-                        roomID: room.id,
-                        displayName: identity.displayName,
-                        avatar: identity.avatar
-                    )),
-                    to: [room.descriptor.hostApplicationID],
-                    roomID: room.id
-                )
+                guard pendingJoins[room.id]?.id == requestID else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                pendingJoins[room.id]?.continuation = continuation
+                guard !Task.isCancelled else {
+                    finishJoin(room.id, requestID: requestID, result: .failure(CancellationError()))
+                    return
+                }
+                pendingJoins[room.id]?.connectionTask = Task { @NexoActor [weak self, transport] in
+                    do {
+                        let host = try await transport.connect(to: advertisement)
+                        try Task.checkCancellation()
+                        self?.completeJoinConnection(to: room, host: host, requestID: requestID)
+                    } catch {
+                        let failure: any Error = error is CancellationError
+                            ? CancellationError() : RoomError.transportFailure(NexoReason(error: error))
+                        self?.finishJoin(room.id, requestID: requestID, result: .failure(failure))
+                    }
+                }
             }
         } onCancel: {
-            Task { @MainActor [weak self] in
-                self?.finishJoin(room.id, result: .failure(CancellationError()))
+            Task { @NexoActor [weak self] in
+                self?.finishJoin(room.id, requestID: requestID, result: .failure(CancellationError()))
             }
         }
     }
@@ -281,14 +407,19 @@ public final class RoomCoordinator {
     /// Leaves the room. Doesn't close any physical connection: other rooms
     /// and activities sharing those peers keep working.
     public func leave(_ roomID: RoomID) {
-        guard let session = sessions.removeValue(forKey: roomID) else { return }
+        guard let session = sessions[roomID] else {
+            finishJoin(roomID, result: .failure(RoomError.roomNotFound))
+            return
+        }
         let remoteApplicationIDs = session.remoteMembers.map(\.applicationID)
 
-        session.removeAllActivities(reason: "Has salido de la sala.")
+        transfers.cancelAll(in: session)
+        session.removeAllActivities(reason: .leftRoom)
+        session.setAccessState(.closed(reason: .leftRoom))
 
         if session.isLocalHost {
             broadcast(
-                .roomClosed(RoomClosedPayload(roomID: roomID, reason: "El anfitrión cerró la sala.")),
+                .roomClosed(RoomClosedPayload(roomID: roomID, reason: .hostClosed)),
                 in: session
             )
         } else {
@@ -299,42 +430,27 @@ public final class RoomCoordinator {
             )
         }
 
-        outboxes.removeValue(forKey: roomID)
-        receivedEnvelopeIDs.removeValue(forKey: roomID)
-        receivedEnvelopeOrder.removeValue(forKey: roomID)
-        for applicationID in remoteApplicationIDs {
-            cancelRecoveryIfUnused(for: applicationID)
-        }
-
-        // Doesn't auto-reassign another session: which room becomes active is
-        // a navigation decision for the UI, not an arbitrary dictionary-order pick.
-        if activeRoomID == roomID {
-            activeRoomID = nil
-        }
-
-        finishJoin(roomID, result: .failure(RoomError.roomNotFound))
+        discardSession(roomID, publishes: false)
+        finishJoin(roomID, result: .failure(RoomError.roomNotFound), publishes: false)
         publishAdvertisement()
+        publishRooms()
     }
 
     public func setActiveRoom(_ roomID: RoomID?) {
         activeRoomID = roomID
-    }
-
-    /// Sender for a specific room.
-    public func outbox(for roomID: RoomID) -> RoomOutbox? {
-        outboxes[roomID]
+        publishRooms()
     }
 
     /// Forgets discovery without touching rooms. Used on suspend: advertisements
     /// expire, but membership is kept so it can be recovered on foreground return.
     public func forgetDiscoveredPeers() {
-        advertisements.removeAll()
+        directory.suspend(keeping: Set(sessions.keys))
         connectedPeers.removeAll()
-        discoveredRooms = discoveredRooms.filter { sessions[$0.key] != nil }
+        publishRooms()
     }
 
     /// Closes every room. Used by the manager on logout or when stopping the stack.
-    public func closeAll(reason: String) {
+    public func closeAll(reason: NexoReason) {
         for task in recoveryTasks.values { task.cancel() }
         recoveryTasks.removeAll()
         recoveryDeadlines.removeAll()
@@ -342,36 +458,42 @@ public final class RoomCoordinator {
         hostMigrationTasks.removeAll()
 
         for session in sessions.values {
+            transfers.cancelAll(in: session)
             session.removeAllActivities(reason: reason)
             session.setAccessState(.closed(reason: reason))
         }
 
-        for roomID in joinContinuations.keys {
-            finishJoin(roomID, result: .failure(RoomError.transportFailure(reason)))
+        for roomID in Array(pendingJoins.keys) {
+            finishJoin(roomID, result: .failure(RoomError.transportFailure(reason)), publishes: false)
         }
 
         sessions.removeAll()
         outboxes.removeAll()
         receivedEnvelopeIDs.removeAll()
         receivedEnvelopeOrder.removeAll()
-        discoveredRooms.removeAll()
-        advertisements.removeAll()
+        directory.clear()
         connectedPeers.removeAll()
         activeRoomID = nil
+        publishRooms()
     }
 
     // MARK: - Join approval
 
-    public func respond(to request: RoomJoinRequest, accept: Bool, reason: String? = nil) {
+    public func respond(to request: RoomJoinRequest, accept: Bool, reason: NexoReason? = nil) {
         guard let session = sessions[request.roomID],
               session.isLocalHost,
-              session.removeJoinRequest(request.id) != nil else { return }
+              let request = session.removeJoinRequest(request.id),
+              let peer = connectedPeers[request.applicationID],
+              request.connectionSessionID == nil || request.connectionSessionID == peer.connectionSessionID
+        else { return }
 
-        guard accept else {
+        guard accept, !session.descriptor.isFull,
+              session.members.count < P2PLimits.recoveryMemberLimit else {
             send(
                 .joinRoomRejected(JoinRoomRejectedPayload(
                     roomID: request.roomID,
-                    reason: reason ?? "El anfitrión ha rechazado tu entrada."
+                    reason: accept ? .roomFull : (reason ?? .hostRejected),
+                    requestID: request.requestID
                 )),
                 to: [request.applicationID],
                 roomID: request.roomID
@@ -383,7 +505,8 @@ public final class RoomCoordinator {
             applicationID: request.applicationID,
             displayName: request.displayName,
             avatar: request.avatar,
-            to: session
+            to: session,
+            requestID: request.requestID
         )
     }
 
@@ -438,14 +561,19 @@ public final class RoomCoordinator {
         announcement: ActivityAnnouncement
     ) throws -> any RoomActivity {
         guard let session = sessions[roomID] else { throw RoomError.roomNotFound }
-        guard session.features.hasActivities else { throw RoomError.featureUnavailable("partidas") }
-        guard !isExclusive || session.canStartActivity else { throw RoomError.activityAlreadyRunning }
+        guard session.features.hasActivities else { throw RoomError.featureUnavailable(.activities) }
+        guard session.accessState == .joined else { throw RoomError.notAMember }
+        guard session.activities.count < P2PLimits.recoveryActivityLimit,
+              !isExclusive || session.canStartActivity else { throw RoomError.activityAlreadyRunning }
 
         // With no explicit list the activity stays open to the room: whoever
         // joins later is admitted only while it hasn't started.
         let admitsRoomMembers = participants == nil
         var participantIDs = Set(participants ?? session.members.map(\.applicationID))
         participantIDs.insert(identity.applicationID)
+        guard participantIDs.isSubset(of: Set(session.members.map(\.applicationID))) else {
+            throw RoomError.notAMember
+        }
 
         let descriptor = ActivityDescriptor(
             roomID: roomID,
@@ -457,8 +585,13 @@ public final class RoomCoordinator {
             isExclusive: isExclusive
         )
 
-        guard let activity = registry.makeActivity(for: session.makeActivityContext(for: descriptor)) else {
-            throw RoomError.featureUnavailable(kind.rawValue)
+        guard let activity = registry.makeActivity(for: session.makeActivityContext(
+            for: descriptor,
+            endActivity: { [weak self] reason in
+                self?.endActivity(descriptor.id, in: descriptor.roomID, reason: reason)
+            }
+        )) else {
+            throw RoomError.activityUnsupported(kind)
         }
 
         session.register(activity)
@@ -485,7 +618,7 @@ public final class RoomCoordinator {
     }
 
     /// Ends the activity. The room and its chat remain intact.
-    public func endActivity(_ activityID: ActivityID, in roomID: RoomID, reason: String) {
+    public func endActivity(_ activityID: ActivityID, in roomID: RoomID, reason: NexoReason) {
         guard let session = sessions[roomID],
               let activity = session.activity(activityID) else { return }
 
@@ -524,53 +657,41 @@ public final class RoomCoordinator {
 
 // MARK: - Transport events
 
-@MainActor
+@NexoActor
 public extension RoomCoordinator {
 
-    func handleAdvertisement(_ advertisement: PeerAdvertisement) {
-        advertisements[advertisement.endpointID] = advertisement
-
-        guard advertisement.isCompatible else { return }
-
-        // The TXT record may be truncated to the first few rooms. Only accept
-        // descriptors whose host matches the device advertising them.
-        let validDescriptors = advertisement.rooms.filter { descriptor in
-            descriptor.hostApplicationID == advertisement.applicationID
-        }
-        let stillAdvertised = Set(validDescriptors.map(\.id))
-
-        for descriptor in validDescriptors {
-            discoveredRooms[descriptor.id] = DiscoveredRoom(
-                descriptor: descriptor,
-                advertisedBy: advertisement.endpointID,
-                hostDisplayName: advertisement.displayName,
-                discoveredAt: discoveredRooms[descriptor.id]?.discoveredAt ?? Date()
-            )
-        }
-
-        // If the TXT record declares more rooms than fit, a missing room
-        // doesn't mean it closed: the full directory arrives after the
-        // handshake, and removal reconciliation happens there.
-        if !advertisement.hasUndisclosedRooms {
-            for (roomID, room) in discoveredRooms
-            where room.advertisedBy == advertisement.endpointID && !stillAdvertised.contains(roomID) {
-                discoveredRooms.removeValue(forKey: roomID)
-            }
-        }
-
-        // The mesh completes lazily: every time an advertisement is seen, try
-        // connecting to our rooms' members that are still missing.
-        reconnectMissingMembers()
-    }
-
-    func handleAdvertisementLost(_ endpointID: TransportPeerID) {
-        advertisements.removeValue(forKey: endpointID)
-        for (roomID, room) in discoveredRooms where room.advertisedBy == endpointID {
-            discoveredRooms.removeValue(forKey: roomID)
+    func handle(_ event: PeerTransportEvent) {
+        guard event.epoch == transport.epoch else { return }
+        switch event {
+        case .advertisementFound(let advertisement, _), .advertisementUpdated(let advertisement, _):
+            handleAdvertisement(advertisement)
+        case .advertisementLost(let endpointID, _):
+            handleAdvertisementLost(endpointID)
+        case .peerConnected(let peer, _):
+            handlePeerConnected(peer)
+        case .peerDisconnected(let applicationID, let reason, _):
+            handlePeerDisconnected(applicationID: applicationID, reason: reason)
+        case .received(let envelope, let peer, _):
+            route(envelope, from: peer)
+        case .lifecycleChanged(let lifecycle, _):
+            handleLifecycle(lifecycle)
+        case .localNetworkPermissionChanged:
+            break
         }
     }
 
-    func handlePeerConnected(_ peer: ConnectedPeer) {
+    internal func handleAdvertisement(_ advertisement: PeerAdvertisement) {
+        directory.update(advertisement)
+        publishRooms()
+        if advertisement.isCompatible { reconnectMissingMembers() }
+    }
+
+    internal func handleAdvertisementLost(_ endpointID: TransportPeerID) {
+        directory.remove(endpointID)
+        publishRooms()
+    }
+
+    internal func handlePeerConnected(_ peer: ConnectedPeer) {
         let wasRecovering = recoveryDeadlines.removeValue(forKey: peer.applicationID) != nil
         recoveryTasks.removeValue(forKey: peer.applicationID)?.cancel()
         hostMigrationTasks.removeValue(forKey: peer.applicationID)?.cancel()
@@ -579,6 +700,11 @@ public extension RoomCoordinator {
             return
         }
         connectedPeers[peer.applicationID] = peer
+        for operation in Array(pendingJoins.values) where operation.hostApplicationID == peer.applicationID {
+            if let room = operation.roomToJoin {
+                completeJoinConnection(to: room, host: peer, requestID: operation.id)
+            }
+        }
 
         // Bonjour can only advertise a subset of rooms. The handshake lets us
         // request the full catalog without opening another physical connection.
@@ -614,26 +740,14 @@ public extension RoomCoordinator {
         where session.descriptor.hostApplicationID == peer.applicationID
             && (wasRecovering || session.accessState != .joined) {
 
-            send(
-                .joinRoomRequest(JoinRoomRequestPayload(
-                    roomID: session.roomID,
-                    displayName: identity.displayName,
-                    avatar: identity.avatar
-                )),
-                to: [peer.applicationID],
-                roomID: session.roomID
-            )
+            beginRecoveryJoin(in: session, from: peer)
         }
 
         // Explicit history completes the short resume snapshot. The host
         // offers the aggregated conversation; a guest only offers its own
         // messages so the host stays the aggregator and each sender its own authority.
         for session in sessions.values where session.contains(peer.applicationID) {
-            sendChatHistory(
-                of: session,
-                to: peer.applicationID,
-                onlyMessagesAuthoredByLocal: !session.isLocalHost
-            )
+            sendChatHistory(of: session, to: peer.applicationID)
             outboxes[session.roomID]?.replay(to: peer.applicationID)
         }
     }
@@ -643,12 +757,15 @@ public extension RoomCoordinator {
         send(
             .roomDirectoryRequest,
             to: [peer.applicationID],
-            roomID: RoomID()
+            roomID: directoryRequestRoomID
         )
     }
 
-    func handlePeerDisconnected(applicationID: String, reason: String?) {
+    internal func handlePeerDisconnected(applicationID: String, reason: NexoReason?) {
         connectedPeers.removeValue(forKey: applicationID)
+        for (roomID, operation) in pendingJoins where operation.hostApplicationID == applicationID {
+            finishJoin(roomID, requestID: operation.id, result: .failure(RoomError.peerUnavailable))
+        }
         var isMemberOfAnyRoom = false
 
         for session in sessions.values {
@@ -670,7 +787,7 @@ public extension RoomCoordinator {
         }
     }
 
-    func handleLifecycle(_ lifecycle: ConnectivityLifecycle) {
+    internal func handleLifecycle(_ lifecycle: ConnectivityLifecycle) {
         switch lifecycle {
         case .suspended:
             // The transport will close, but logical presence doesn't change.
@@ -683,7 +800,6 @@ public extension RoomCoordinator {
             }
 
         case .active:
-            reconcilePhysicalPeers()
             for applicationID in recoveryDeadlines.keys {
                 scheduleRecoveryAttempt(for: applicationID)
             }
@@ -691,7 +807,6 @@ public extension RoomCoordinator {
 
         case .disconnected:
             connectedPeers.removeAll()
-            reconcilePhysicalPeers()
             for session in sessions.values {
                 for member in session.remoteMembers where connectedPeers[member.applicationID] == nil {
                     beginTemporaryRecovery(for: member.applicationID, scheduleAttempt: true)
@@ -705,17 +820,23 @@ public extension RoomCoordinator {
 
     /// Entry point for every received envelope. Validation order is physical
     /// connection, room, membership, channel, and finally the typed payload.
-    func route(_ envelope: RoomEnvelope, from peer: ConnectedPeer) {
-        connectedPeers[peer.applicationID] = peer
+    internal func route(_ envelope: RoomEnvelope, from peer: ConnectedPeer) {
+        guard envelope.senderApplicationID == peer.applicationID,
+              peer.applicationID != identity.applicationID,
+              peer.supports(.rooms),
+              P2PProtocolInfo.isCompatible(remoteVersion: envelope.protocolVersion),
+              envelope.payload.count <= P2PLimits.maximumEnvelopeBytes,
+              connectedPeers[peer.applicationID]?.connectionSessionID == peer.connectionSessionID
+        else { return }
 
         if envelope.channel == .control {
-            guard remember(envelope.messageID, for: envelope.roomID) else { return }
+            guard envelope.activityID == nil else { return }
             handleControl(envelope, from: peer)
             return
         }
 
-        guard let session = sessions[envelope.roomID] else { return }
-        guard session.contains(peer.applicationID),
+        guard let session = sessions[envelope.roomID],
+              hasMembership(in: session, from: peer),
               let member = session.member(peer.applicationID) else { return }
 
         switch envelope.channel {
@@ -723,32 +844,65 @@ public extension RoomCoordinator {
             break
 
         case .chat:
-            guard session.features.hasChat,
-                  remember(envelope.messageID, for: envelope.roomID) else { return }
+            guard session.features.hasChat, peer.supports(.chat), envelope.activityID == nil,
+                  remember(envelope.messageID, from: peer.applicationID) else { return }
             session.chat?.receive(payload: envelope.payload, from: member)
 
         case .activity:
-            guard let activityID = envelope.activityID,
+            guard session.features.hasActivities, peer.supports(.activities),
+                  let activityID = envelope.activityID,
                   let activity = session.activity(activityID),
+                  activity.descriptor.includes(identity.applicationID),
                   activity.descriptor.includes(peer.applicationID),
-                  remember(envelope.messageID, for: envelope.roomID) else { return }
+                  remember(envelope.messageID, from: peer.applicationID) else { return }
             activity.receive(payload: envelope.payload, from: member)
 
         case .fileTransfer:
-            guard session.features.hasFileTransfer,
-                  remember(envelope.messageID, for: envelope.roomID) else { return }
-            fileTransferHandler?(envelope, member, session)
+            guard session.features.hasFileTransfer, peer.supports(.fileTransfer), envelope.activityID == nil,
+                  remember(envelope.messageID, from: peer.applicationID) else { return }
+            transfers.handle(envelope: envelope, from: member, in: session)
         }
     }
 }
 
 // MARK: - Control messages
 
-@MainActor
+@NexoActor
 private extension RoomCoordinator {
 
+    func hasMembership(in session: RoomSession, from peer: ConnectedPeer) -> Bool {
+        guard session.contains(identity.applicationID), session.contains(peer.applicationID) else { return false }
+        switch session.accessState {
+        case .joined, .suspended, .reconnecting: return true
+        case .available, .awaitingApproval, .rejected, .closed: return false
+        }
+    }
+
+    func allowsControl(_ message: RoomControlMessage, from peer: ConnectedPeer, roomID: RoomID) -> Bool {
+        switch message {
+        case .roomDirectoryRequest, .roomDirectory, .joinRoomRequest:
+            return true
+        case .joinRoomAccepted(let payload):
+            return matchesPendingJoin(roomID, requestID: payload.requestID, from: peer)
+        case .joinRoomRejected(let payload):
+            return matchesPendingJoin(roomID, requestID: payload.requestID, from: peer)
+        case .roomClosed:
+            return sessions[roomID]?.descriptor.hostApplicationID == peer.applicationID
+        case .leaveRoom:
+            guard let session = sessions[roomID] else { return false }
+            return hasMembership(in: session, from: peer)
+                || (session.isLocalHost && session.pendingJoinRequests.contains { $0.applicationID == peer.applicationID })
+        default:
+            guard let session = sessions[roomID] else { return false }
+            return hasMembership(in: session, from: peer)
+        }
+    }
+
     func handleControl(_ envelope: RoomEnvelope, from peer: ConnectedPeer) {
-        guard let message = try? envelope.decodePayload(as: RoomControlMessage.self) else { return }
+        guard let message = try? envelope.decodePayload(as: RoomControlMessage.self),
+              message.roomID == nil || message.roomID == envelope.roomID,
+              allowsControl(message, from: peer, roomID: envelope.roomID),
+              remember(envelope.messageID, from: peer.applicationID) else { return }
 
         switch message {
 
@@ -765,28 +919,11 @@ private extension RoomCoordinator {
             )
 
         case .roomDirectory(let payload):
-            guard let endpointID = endpointID(for: peer.applicationID) else { return }
-
-            let validDescriptors = payload.rooms.filter {
-                $0.hostApplicationID == peer.applicationID
-            }
-            let roomIDs = Set(validDescriptors.map(\.id))
-
-            for descriptor in validDescriptors where sessions[descriptor.id] == nil {
-                discoveredRooms[descriptor.id] = DiscoveredRoom(
-                    descriptor: descriptor,
-                    advertisedBy: endpointID,
-                    hostDisplayName: payload.hostDisplayName,
-                    discoveredAt: discoveredRooms[descriptor.id]?.discoveredAt ?? Date()
-                )
-            }
-
-            // The full directory does let us know which rooms have ended,
-            // even when the TXT advertisement only carried the first three.
-            for (roomID, room) in discoveredRooms
-            where room.advertisedBy == endpointID && !roomIDs.contains(roomID) {
-                discoveredRooms.removeValue(forKey: roomID)
-            }
+            guard let roomIDs = directory.update(
+                payload,
+                from: peer,
+                joinedIDs: Set(sessions.keys)
+            ) else { return }
 
             // A host may restart and recreate a room with the same name but a
             // new ID. Its full directory is authoritative: discard any old
@@ -796,29 +933,22 @@ private extension RoomCoordinator {
                     && !roomIDs.contains($0.roomID)
             }
             for session in staleSessions {
-                let reason = "La sala ya no está disponible."
+                let reason: NexoReason = .roomUnavailable
                 let roomID = session.roomID
-                let remoteApplicationIDs = session.remoteMembers.map(\.applicationID)
-
                 session.removeAllActivities(reason: reason)
                 session.setAccessState(.closed(reason: reason))
-                sessions.removeValue(forKey: roomID)
-                outboxes.removeValue(forKey: roomID)
-                receivedEnvelopeIDs.removeValue(forKey: roomID)
-                receivedEnvelopeOrder.removeValue(forKey: roomID)
-                for applicationID in remoteApplicationIDs {
-                    cancelRecoveryIfUnused(for: applicationID)
-                }
-
-                if activeRoomID == roomID { activeRoomID = nil }
-                finishJoin(roomID, result: .failure(RoomError.roomNotFound))
-                noticeHandler?(.roomClosed(P2PRoomClosedNotice(
-                    roomID: roomID,
-                    reason: reason
-                )))
+                discardSession(roomID, publishes: false)
+                finishJoin(roomID, result: .failure(RoomError.roomNotFound), publishes: false)
             }
             if !staleSessions.isEmpty {
                 publishAdvertisement()
+            }
+            publishRooms()
+            for session in staleSessions {
+                publishNotice(.roomClosed(P2PRoomClosedNotice(
+                    roomID: session.roomID,
+                    reason: .roomUnavailable
+                )))
             }
 
         // MARK: Membership
@@ -830,19 +960,12 @@ private extension RoomCoordinator {
             handleJoinAccepted(payload, from: peer)
 
         case .joinRoomRejected(let payload):
-            guard let session = sessions[payload.roomID],
-                  session.descriptor.hostApplicationID == peer.applicationID else { return }
+            guard matchesPendingJoin(payload.roomID, requestID: payload.requestID, from: peer),
+                  let session = sessions[payload.roomID] else { return }
+            session.removeAllActivities(reason: payload.reason)
             session.setAccessState(.rejected(reason: payload.reason))
-            sessions.removeValue(forKey: payload.roomID)
-            outboxes.removeValue(forKey: payload.roomID)
-            receivedEnvelopeIDs.removeValue(forKey: payload.roomID)
-            receivedEnvelopeOrder.removeValue(forKey: payload.roomID)
-            cancelRecoveryIfUnused(for: peer.applicationID)
-            // `join(_:)` optimistically marks the room active while waiting
-            // for the host's response. On rejection this must be reverted, or
-            // `activeRoomID` would point at an already-removed session.
-            if activeRoomID == payload.roomID { activeRoomID = nil }
-            finishJoin(payload.roomID, result: .failure(RoomError.joinRejected(payload.reason)))
+            discardSession(payload.roomID)
+            finishJoin(payload.roomID, requestID: payload.requestID, result: .failure(RoomError.joinRejected(payload.reason)))
 
         case .leaveRoom(let payload):
             guard let session = sessions[payload.roomID] else { return }
@@ -851,34 +974,26 @@ private extension RoomCoordinator {
             } else {
                 var members = session.members
                 members.removeAll { $0.applicationID == peer.applicationID }
-                session.apply(members: members)
+                apply(members, to: session)
             }
 
         case .roomMembershipChanged(let payload):
             guard let session = sessions[payload.descriptor.id],
-                  payload.descriptor.hostApplicationID == peer.applicationID,
-                  payload.descriptor.hostGeneration >= session.descriptor.hostGeneration else { return }
-            if payload.descriptor.hostGeneration > session.descriptor.hostGeneration {
-                let available = Set(connectedPeers.keys).union([identity.applicationID])
-                guard payload.descriptor.hostGeneration == session.descriptor.hostGeneration + 1,
-                      connectedPeers[session.descriptor.hostApplicationID] == nil,
-                      let election = RoomHostElection.successor(
-                          in: session.members,
-                          after: session.descriptor.hostApplicationID,
-                          availableApplicationIDs: available
-                      ),
-                      election.applicationID == peer.applicationID,
-                      payload.members.filter(\.isHost).map(\.applicationID) == [peer.applicationID],
-                      Set(payload.members.map(\.applicationID)).count == payload.members.count,
-                      payload.members.contains(where: { $0.applicationID == identity.applicationID }),
-                      payload.descriptor.memberCount == payload.members.count,
-                      payload.descriptor.capacity.map({ payload.members.count <= $0 }) ?? true
+                  RoomMembership.validates(payload.members, descriptor: payload.descriptor, roomID: session.roomID,
+                                           requiring: [identity.applicationID, peer.applicationID]) else { return }
+            if payload.descriptor.hostGeneration == session.descriptor.hostGeneration {
+                guard peer.applicationID == session.descriptor.hostApplicationID,
+                      payload.descriptor.hostApplicationID == session.descriptor.hostApplicationID else { return }
+                session.apply(descriptor: payload.descriptor)
+                apply(payload.members, to: session)
+                session.setAccessState(.joined)
+                connectToMembers(of: session)
+                publishRooms()
+            } else {
+                guard validatesRoomMigration(payload.descriptor, members: payload.members, from: peer, in: session)
                 else { return }
+                applyRoomMigration(payload.descriptor, members: payload.members, to: session)
             }
-            session.apply(descriptor: payload.descriptor)
-            session.apply(members: payload.members)
-            if session.accessState != .joined { session.setAccessState(.joined) }
-            connectToMembers(of: session)
 
         case .roomResume(let payload):
             handleRoomResume(payload, from: peer, roomID: envelope.roomID)
@@ -894,17 +1009,11 @@ private extension RoomCoordinator {
                   session.descriptor.hostApplicationID == peer.applicationID else { return }
             session.removeAllActivities(reason: payload.reason)
             session.setAccessState(.closed(reason: payload.reason))
-            sessions.removeValue(forKey: payload.roomID)
-            outboxes.removeValue(forKey: payload.roomID)
-            receivedEnvelopeIDs.removeValue(forKey: payload.roomID)
-            receivedEnvelopeOrder.removeValue(forKey: payload.roomID)
-            discoveredRooms.removeValue(forKey: payload.roomID)
-            cancelRecoveryIfUnused(for: peer.applicationID)
-            // Same as in `leave`: don't reassign another session by
-            // dictionary order. If the user wants another room, the UI
-            // activates it explicitly by navigating there.
-            if activeRoomID == payload.roomID { activeRoomID = nil }
-            noticeHandler?(.roomClosed(P2PRoomClosedNotice(
+            // Drop the room from discovery first: `discardSession` publishes
+            // and would otherwise announce a room that no longer exists.
+            directory.removeRoom(payload.roomID)
+            discardSession(payload.roomID)
+            publishNotice(.roomClosed(P2PRoomClosedNotice(
                 roomID: payload.roomID,
                 reason: payload.reason
             )))
@@ -922,13 +1031,16 @@ private extension RoomCoordinator {
             handleActivityJoinRequest(payload, from: peer)
 
         case .activityJoinRejected(let payload):
-            guard let session = sessions[payload.roomID] else { return }
+            guard let session = sessions[payload.roomID],
+                  let activity = session.activity(payload.activityID),
+                  activity.isHost(peer.applicationID) else { return }
             session.removeActivity(payload.activityID, reason: payload.reason)
             republishIfHosting(session)
 
         case .activityLeft(let payload):
             guard let session = sessions[payload.roomID],
                   let activity = session.activity(payload.activityID),
+                  activity.descriptor.includes(peer.applicationID),
                   let member = session.member(peer.applicationID) else { return }
             activity.participantDidLeave(member)
 
@@ -958,10 +1070,12 @@ private extension RoomCoordinator {
               let chat = session.chat
         else { return }
 
-        let messages = validatedChatHistoryMessages(
+        let messages = RoomChatHistory.validatedMessages(
             payload.messages,
-            from: peer,
-            in: session
+            roomID: roomID,
+            members: session.members,
+            senderApplicationID: peer.applicationID,
+            hostApplicationID: session.descriptor.hostApplicationID
         )
         guard chat.merge(messages: messages), session.isLocalHost else { return }
 
@@ -973,153 +1087,21 @@ private extension RoomCoordinator {
         }
     }
 
-    /// Validates and normalizes messages received on a recovery channel. The
-    /// envelope's identity determines who can contribute content; the
-    /// embedded `senderDisplayName` is never trusted.
-    func validatedChatHistoryMessages(
-        _ messages: [ChatMessage],
-        from peer: ConnectedPeer,
-        in session: RoomSession,
-        members: [RoomMember]? = nil
-    ) -> [ChatMessage] {
-        guard messages.count <= P2PLimits.recoveryChatMessageLimit else { return [] }
-
-        let knownMembers = members ?? session.members
-        let memberIDs = Set(knownMembers.map(\.applicationID))
-        let isRoomHost = peer.applicationID == session.descriptor.hostApplicationID
-        var messageIDs = Set<UUID>()
-        var validatedMessages: [ChatMessage] = []
-        validatedMessages.reserveCapacity(messages.count)
-
-        for original in messages {
-            guard messageIDs.insert(original.id).inserted,
-                  original.roomID == session.roomID,
-                  !original.senderApplicationID.isEmpty,
-                  original.body.count <= 4_000
-            else { continue }
-
-            if original.senderApplicationID == "system" {
-                guard isRoomHost,
-                      original.kind == .systemInfo,
-                      original.attachment == nil,
-                      original.invitation == nil
-                else { continue }
-
-                var message = original
-                message.senderDisplayName = "Sistema"
-                validatedMessages.append(message)
-                continue
-            }
-
-            guard memberIDs.contains(original.senderApplicationID),
-                  original.kind != .systemInfo
-            else { continue }
-
-            if !isRoomHost,
-               original.senderApplicationID != peer.applicationID {
-                continue
-            }
-
-            switch original.kind {
-            case .text:
-                guard original.attachment == nil else { continue }
-
-            case .attachment:
-                guard let attachment = original.attachment,
-                      original.invitation == nil,
-                      attachment.fileSize > 0,
-                      attachment.fileSize <= P2PLimits.maximumTransferBytes,
-                      !attachment.fileName.isEmpty,
-                      attachment.fileName.utf8.count <= 512,
-                      !attachment.mimeType.isEmpty,
-                      attachment.mimeType.utf8.count <= 256,
-                      !attachment.checksum.isEmpty,
-                      attachment.checksum.utf8.count <= 256
-                else { continue }
-
-            case .systemInfo:
-                continue
-            }
-
-            if let invitation = original.invitation,
-               invitation.roomID != session.roomID {
-                continue
-            }
-
-            guard let member = knownMembers.first(where: {
-                $0.applicationID == original.senderApplicationID
-            }) else { continue }
-
-            var message = original
-            message.senderDisplayName = member.displayName
-            validatedMessages.append(message)
-        }
-
-        return validatedMessages
-    }
-
     /// Sends the retained conversation in chunks that fit a control envelope.
     /// A guest sends only its own messages; the host sends the aggregated
     /// history kept in its session.
-    func sendChatHistory(
-        of session: RoomSession,
-        to applicationID: String,
-        onlyMessagesAuthoredByLocal: Bool = false
-    ) {
+    func sendChatHistory(of session: RoomSession, to applicationID: String) {
         guard session.features.hasChat,
               let chat = session.chat else { return }
 
-        // System notices are generated per device (join/leave wording is
-        // first-person for the local member), so they never travel in history.
-        let messages = chat.messages.filter {
-            $0.kind != .systemInfo
-                && (!onlyMessagesAuthoredByLocal
-                    || $0.senderApplicationID == identity.applicationID)
+        for payload in RoomChatHistory.chunks(
+            chat.messages,
+            roomID: session.roomID,
+            senderApplicationID: identity.applicationID,
+            hostApplicationID: session.descriptor.hostApplicationID
+        ) {
+            send(.chatHistory(payload), to: [applicationID], roomID: session.roomID)
         }
-        guard !messages.isEmpty else { return }
-
-        var chunk: [ChatMessage] = []
-        for message in messages {
-            let candidate = chunk + [message]
-            if candidate.count <= P2PLimits.recoveryChatMessageLimit,
-               chatHistoryFits(candidate, roomID: session.roomID) {
-                chunk = candidate
-                continue
-            }
-
-            if !chunk.isEmpty {
-                send(
-                    .chatHistory(ChatHistoryPayload(
-                        roomID: session.roomID,
-                        messages: chunk
-                    )),
-                    to: [applicationID],
-                    roomID: session.roomID
-                )
-                chunk.removeAll(keepingCapacity: true)
-            }
-
-            guard chatHistoryFits([message], roomID: session.roomID) else { continue }
-            chunk = [message]
-        }
-
-        guard !chunk.isEmpty else { return }
-        send(
-            .chatHistory(ChatHistoryPayload(
-                roomID: session.roomID,
-                messages: chunk
-            )),
-            to: [applicationID],
-            roomID: session.roomID
-        )
-    }
-
-    func chatHistoryFits(_ messages: [ChatMessage], roomID: RoomID) -> Bool {
-        let payload = ChatHistoryPayload(roomID: roomID, messages: messages)
-        guard let encoded = try? P2PCoder.encode(RoomControlMessage.chatHistory(payload)) else {
-            return false
-        }
-        return encoded.count <= P2PLimits.maximumEnvelopeBytes
     }
 
     /// Applies the host's authoritative state, then lets the journal replay
@@ -1139,42 +1121,27 @@ private extension RoomCoordinator {
               payload.chatMessages.count <= P2PLimits.recoveryChatMessageLimit
         else { return }
 
-        let payloadMemberIDs = payload.members.map(\.applicationID)
-        let payloadMemberSet = Set(payloadMemberIDs)
-        guard payloadMemberIDs.count == payloadMemberSet.count,
-              payloadMemberSet.contains(payload.descriptor.hostApplicationID),
-              payloadMemberSet.contains(identity.applicationID),
-              payload.members.contains(where: {
-                  $0.applicationID == payload.descriptor.hostApplicationID && $0.isHost
-              }),
-              payload.descriptor.memberCount == payload.members.count,
-              payload.descriptor.capacity.map({ payload.members.count <= $0 }) ?? true,
-              payload.activities.allSatisfy({ activity in
-                  activity.roomID == roomID
-                      && payloadMemberSet.contains(activity.hostApplicationID)
-                      && activity.participantIDs.isSubset(of: payloadMemberSet)
-              })
-        else { return }
-
         let isRoomHost = peer.applicationID == session.descriptor.hostApplicationID
-        let isValidActivityHost = payload.activities.allSatisfy {
-            isRoomHost || $0.hostApplicationID == peer.applicationID
-        }
-
-        guard isValidActivityHost else { return }
+        guard RoomMembership.validates(payload.members, descriptor: payload.descriptor, roomID: roomID,
+                                       requiring: [identity.applicationID, peer.applicationID]),
+              validatesActivities(payload.activities, roomID: roomID,
+                                  members: isRoomHost ? payload.members : session.members),
+              payload.activities.allSatisfy({ isRoomHost || $0.hostApplicationID == peer.applicationID })
+        else { return }
 
         // The history is validated against the membership the host is about
         // to publish, before mutating descriptor, members or activities.
-        let validMessages = validatedChatHistoryMessages(
+        let validMessages = RoomChatHistory.validatedMessages(
             payload.chatMessages,
-            from: peer,
-            in: session,
-            members: isRoomHost ? payload.members : nil
+            roomID: roomID,
+            members: isRoomHost ? payload.members : session.members,
+            senderApplicationID: peer.applicationID,
+            hostApplicationID: session.descriptor.hostApplicationID
         )
 
         if isRoomHost {
             session.apply(descriptor: payload.descriptor)
-            session.apply(members: payload.members)
+            apply(payload.members, to: session)
         }
 
         let activeDescriptors = payload.activities.filter {
@@ -1193,7 +1160,7 @@ private extension RoomCoordinator {
         for activity in staleActivities {
             session.removeActivity(
                 activity.id,
-                reason: "La actividad ya no está activa."
+                reason: .activityInactive
             )
         }
         if !staleActivities.isEmpty {
@@ -1201,7 +1168,7 @@ private extension RoomCoordinator {
         }
 
         for descriptor in activeDescriptors {
-            instantiateActivity(descriptor, in: session)
+            reconcileActivity(descriptor, from: peer, in: session)
         }
 
         let didMerge = session.chat?.merge(messages: validMessages) ?? false
@@ -1209,6 +1176,7 @@ private extension RoomCoordinator {
         if isRoomHost {
             session.setAccessState(.joined)
             connectToMembers(of: session)
+            publishRooms()
         }
 
         // A guest may have kept its own messages the host didn't have yet.
@@ -1221,89 +1189,72 @@ private extension RoomCoordinator {
         }
     }
 
+    func validatesRoomMigration(
+        _ descriptor: RoomDescriptor,
+        members: [RoomMember],
+        from peer: ConnectedPeer,
+        in session: RoomSession
+    ) -> Bool {
+        let current = session.descriptor
+        guard current.hostGeneration < UInt64.max,
+              descriptor.hostGeneration == current.hostGeneration + 1,
+              descriptor.hostApplicationID == peer.applicationID,
+              connectedPeers[current.hostApplicationID] == nil,
+              current.hostApplicationID != identity.applicationID,
+              RoomMembership.validates(members, descriptor: descriptor, roomID: session.roomID,
+                                       requiring: [identity.applicationID, peer.applicationID]),
+              members.map(\.applicationID) == session.members.map(\.applicationID)
+                  .filter({ $0 != current.hostApplicationID }),
+              descriptor.name == current.name,
+              descriptor.features == current.features,
+              descriptor.activityKind == current.activityKind,
+              descriptor.accessPolicy == current.accessPolicy,
+              descriptor.capacity == current.capacity,
+              descriptor.protocolVersion == current.protocolVersion,
+              let election = RoomHostElection.successor(
+                  in: session.members,
+                  after: current.hostApplicationID,
+                  availableApplicationIDs: Set(connectedPeers.keys).union([identity.applicationID])
+              ) else { return false }
+        return election.applicationID == peer.applicationID
+    }
+
     func handleRoomHostChanged(
         _ payload: RoomHostChangedPayload,
         from peer: ConnectedPeer,
         roomID: RoomID
     ) {
         guard let session = sessions[roomID],
-              payload.descriptor.id == roomID,
               payload.failedHostApplicationID == session.descriptor.hostApplicationID,
-              payload.descriptor.hostApplicationID == peer.applicationID,
-              payload.descriptor.hostGeneration == session.descriptor.hostGeneration + 1,
-              connectedPeers[payload.failedHostApplicationID] == nil,
-              payload.members.count <= P2PLimits.recoveryMemberLimit,
-              payload.activities.count <= P2PLimits.recoveryActivityLimit
-        else { return }
+              validatesRoomMigration(payload.descriptor, members: payload.members, from: peer, in: session),
+              RoomHostElection.validates(
+                  RoomHostElection.Result(applicationID: peer.applicationID,
+                                          skippedApplicationIDs: payload.skippedApplicationIDs),
+                  in: session.members,
+                  after: payload.failedHostApplicationID
+              ) else { return }
 
-        let election = RoomHostElection.Result(
-            applicationID: peer.applicationID,
-            skippedApplicationIDs: payload.skippedApplicationIDs
-        )
-        guard RoomHostElection.validates(
-            election,
-            in: session.members,
-            after: payload.failedHostApplicationID
-        ) else { return }
+        applyRoomMigration(payload.descriptor, members: payload.members, to: session)
 
-        let memberIDs = payload.members.map(\.applicationID)
-        let memberIDSet = Set(memberIDs)
-        let expectedMemberIDs = Set(session.members.map(\.applicationID))
-            .subtracting([payload.failedHostApplicationID])
-        guard memberIDs.count == memberIDSet.count,
-              memberIDSet == expectedMemberIDs,
-              memberIDSet.contains(identity.applicationID),
-              memberIDSet.contains(peer.applicationID),
-              payload.members.filter(\.isHost).map(\.applicationID) == [peer.applicationID],
-              payload.members.allSatisfy({
-                  $0.applicationID == peer.applicationID || !$0.isHost
-              }),
-              payload.descriptor.memberCount == payload.members.count,
-              payload.descriptor.capacity.map({ payload.members.count <= $0 }) ?? true
-        else { return }
-
-        var activityDescriptors: [ActivityID: ActivityDescriptor] = [:]
-        for descriptor in payload.activities {
-            guard activityDescriptors[descriptor.id] == nil else { return }
-            activityDescriptors[descriptor.id] = descriptor
-        }
-        guard activityDescriptors.count == session.activities.count,
-              session.activities.values.allSatisfy({ activity in
-                  guard let migrated = activityDescriptors[activity.id],
-                        migrated.roomID == roomID,
-                        migrated.kind == activity.kind,
-                        migrated.participantIDs == activity.descriptor.participantIDs
-                            .subtracting([payload.failedHostApplicationID]),
-                        migrated.participantIDs.isSubset(of: memberIDSet),
-                        memberIDSet.contains(migrated.hostApplicationID)
-                  else { return false }
-
-                  if activity.descriptor.hostApplicationID == payload.failedHostApplicationID {
-                      return migrated.hostApplicationID == peer.applicationID
-                          && migrated.hostGeneration == activity.descriptor.hostGeneration + 1
-                  }
-                  return migrated.hostApplicationID == activity.descriptor.hostApplicationID
-                      && migrated.hostGeneration == activity.descriptor.hostGeneration
-              })
-        else { return }
-
-        session.apply(descriptor: payload.descriptor)
-        for activity in session.activities.values {
-            guard let descriptor = activityDescriptors[activity.id] else { continue }
-            var descriptorForAuthorityUpdate = descriptor
-            if activity.descriptor.includes(payload.failedHostApplicationID) {
-                descriptorForAuthorityUpdate.participantIDs.insert(payload.failedHostApplicationID)
+        // A room successor may not even know a private activity. Only its own
+        // activity authority can reconcile data; omissions never delete local activities.
+        if validatesActivities(payload.activities, roomID: roomID, members: payload.members) {
+            for descriptor in payload.activities where descriptor.hostApplicationID == peer.applicationID
+                && descriptor.includes(identity.applicationID) {
+                reconcileActivity(descriptor, from: peer, in: session)
             }
-            activity.apply(descriptor: descriptorForAuthorityUpdate)
         }
-        session.apply(members: payload.members)
-        for activity in session.activities.values {
-            guard let descriptor = activityDescriptors[activity.id] else { continue }
-            activity.apply(descriptor: descriptor)
-        }
+    }
+
+    func applyRoomMigration(_ descriptor: RoomDescriptor, members: [RoomMember], to session: RoomSession) {
+        let migratedIDs = prepareActivityMigration(after: session.descriptor.hostApplicationID, in: session)
+        session.apply(descriptor: descriptor)
+        apply(members, to: session)
         session.setAccessState(.joined)
-        session.chat?.appendSystemMessage(String(localized: "El anfitrión de la sala ha cambiado."))
+        session.record(.hostChanged)
+        announceMigratedActivities(migratedIDs, in: session)
         connectToMembers(of: session)
+        publishRooms()
     }
 
     func handleJoinRequest(_ payload: JoinRoomRequestPayload, from peer: ConnectedPeer) {
@@ -1311,7 +1262,8 @@ private extension RoomCoordinator {
             send(
                 .joinRoomRejected(JoinRoomRejectedPayload(
                     roomID: payload.roomID,
-                    reason: "La sala ya no existe."
+                    reason: .roomUnavailable,
+                    requestID: payload.requestID
                 )),
                 to: [peer.applicationID],
                 roomID: payload.roomID
@@ -1321,15 +1273,16 @@ private extension RoomCoordinator {
 
         // A member reconnecting who was already here: just reaffirm membership.
         if session.contains(peer.applicationID) {
-            sendAcceptance(of: session, to: peer.applicationID)
+            sendAcceptance(of: session, to: peer.applicationID, requestID: payload.requestID)
             return
         }
 
-        guard !session.descriptor.isFull else {
+        guard !session.descriptor.isFull, session.members.count < P2PLimits.recoveryMemberLimit else {
             send(
                 .joinRoomRejected(JoinRoomRejectedPayload(
                     roomID: payload.roomID,
-                    reason: RoomError.roomFull.localizedDescription
+                    reason: .roomFull,
+                    requestID: payload.requestID
                 )),
                 to: [peer.applicationID],
                 roomID: payload.roomID
@@ -1343,19 +1296,27 @@ private extension RoomCoordinator {
                 applicationID: peer.applicationID,
                 displayName: payload.displayName,
                 avatar: payload.avatar,
-                to: session
+                to: session,
+                requestID: payload.requestID
             )
 
         case .approval:
+            if let existing = session.pendingJoinRequests.first(where: { $0.applicationID == peer.applicationID }) {
+                guard existing.requestID != payload.requestID
+                    || existing.connectionSessionID != peer.connectionSessionID else { return }
+                session.removeJoinRequests(for: peer.applicationID)
+            }
             let request = RoomJoinRequest(
                 roomID: payload.roomID,
                 applicationID: peer.applicationID,
                 displayName: payload.displayName,
-                avatar: payload.avatar
+                avatar: payload.avatar,
+                requestID: payload.requestID,
+                connectionSessionID: peer.connectionSessionID
             )
             guard session.enqueueJoinRequest(request) else { return }
 
-            noticeHandler?(.joinRequest(P2PJoinRequestNotice(
+            publishNotice(.joinRequest(P2PJoinRequestNotice(
                 requestID: request.id,
                 roomID: request.roomID,
                 displayName: request.displayName
@@ -1364,46 +1325,39 @@ private extension RoomCoordinator {
     }
 
     func handleJoinAccepted(_ payload: JoinRoomAcceptedPayload, from peer: ConnectedPeer) {
-        guard payload.descriptor.hostApplicationID == peer.applicationID else { return }
-
-        // A RoomID must never change host. This stops a remote payload from
-        // reusing a local room's identifier and replacing it.
-        if let existing = sessions[payload.descriptor.id],
-           existing.descriptor.hostApplicationID != peer.applicationID
-            || payload.descriptor.hostGeneration < existing.descriptor.hostGeneration {
-            return
-        }
-
-        let session = sessions[payload.descriptor.id]
-            ?? makeSession(descriptor: payload.descriptor, accessState: .joined)
+        let roomID = payload.descriptor.id
+        guard matchesPendingJoin(roomID, requestID: payload.requestID, from: peer),
+              let session = sessions[roomID],
+              peer.applicationID == session.descriptor.hostApplicationID,
+              payload.descriptor.hostApplicationID == peer.applicationID,
+              payload.descriptor.hostGeneration == session.descriptor.hostGeneration,
+              RoomMembership.validates(payload.members, descriptor: payload.descriptor, roomID: roomID,
+                                       requiring: [identity.applicationID, peer.applicationID]),
+              validatesActivities(payload.activities, roomID: roomID, members: payload.members)
+        else { return }
 
         session.apply(descriptor: payload.descriptor)
-        session.apply(members: payload.members)
+        apply(payload.members, to: session)
         session.setAccessState(.joined)
-        sessions[payload.descriptor.id] = session
-        activeRoomID = payload.descriptor.id
+        activeRoomID = roomID
 
-        // Activities already running by the time we joined.
-        for descriptor in payload.activities where descriptor.isActive {
-            instantiateActivity(descriptor, in: session)
+        // A room host can introduce activities, but cannot change another activity's authority.
+        for descriptor in payload.activities where descriptor.isActive && descriptor.includes(identity.applicationID) {
+            reconcileActivity(descriptor, from: peer, in: session)
         }
 
         connectToMembers(of: session)
-        if peer.applicationID == session.descriptor.hostApplicationID {
-            sendChatHistory(
-                of: session,
-                to: peer.applicationID,
-                onlyMessagesAuthoredByLocal: true
-            )
-        }
-        finishJoin(payload.descriptor.id, result: .success(session))
+        sendChatHistory(of: session, to: peer.applicationID)
+        publishRooms()
+        finishJoin(roomID, requestID: payload.requestID, result: .success(session))
     }
 
     func admit(
         applicationID: String,
         displayName: String,
         avatar: String?,
-        to session: RoomSession
+        to session: RoomSession,
+        requestID: UUID?
     ) {
         var members = session.members
         if !members.contains(where: { $0.applicationID == applicationID }) {
@@ -1414,14 +1368,14 @@ private extension RoomCoordinator {
                 avatar: avatar
             ))
         }
-        session.apply(members: members)
+        apply(members, to: session)
         session.removeJoinRequests(for: applicationID)
 
         // Must happen before acceptance: this way the descriptor the
         // newcomer receives already includes them as a participant.
         admitToOpenActivities(applicationID: applicationID, in: session)
 
-        sendAcceptance(of: session, to: applicationID)
+        sendAcceptance(of: session, to: applicationID, requestID: requestID)
         // The rest of the room gets the new list and opens a connection to
         // the newcomer, completing the mesh.
         sendMembership(
@@ -1469,19 +1423,22 @@ private extension RoomCoordinator {
     func remove(applicationID: String, from session: RoomSession) {
         var members = session.members
         members.removeAll { $0.applicationID == applicationID }
-        session.apply(members: members)
+        apply(members, to: session)
         session.removeJoinRequests(for: applicationID)
         cancelRecoveryIfUnused(for: applicationID)
         sendMembership(of: session, to: session.remoteMembers.map(\.applicationID))
         publishAdvertisement()
     }
 
-    func sendAcceptance(of session: RoomSession, to applicationID: String) {
+    func sendAcceptance(of session: RoomSession, to applicationID: String, requestID: UUID?) {
         send(
             .joinRoomAccepted(JoinRoomAcceptedPayload(
                 descriptor: session.descriptor,
                 members: session.members,
-                activities: session.activities.values.map(\.descriptor).filter(\.isActive)
+                activities: session.activities.values.map(\.descriptor).filter {
+                    $0.isActive && $0.includes(applicationID)
+                },
+                requestID: requestID
             )),
             to: [applicationID],
             roomID: session.roomID
@@ -1507,7 +1464,8 @@ private extension RoomCoordinator {
         onlyActivitiesHostedByLocal: Bool = false
     ) {
         let resumableChatMessages = session.chat?.messages.filter {
-            !onlyActivitiesHostedByLocal || $0.senderApplicationID == identity.applicationID
+            $0.kind != .systemInfo
+                && (!onlyActivitiesHostedByLocal || $0.senderApplicationID == identity.applicationID)
         } ?? []
         var chatMessages = Array(
             resumableChatMessages.suffix(P2PLimits.recoveryChatMessageLimit)
@@ -1515,7 +1473,8 @@ private extension RoomCoordinator {
         let activities = Array(
             session.activities.values
                 .filter { activity in
-                    !onlyActivitiesHostedByLocal || activity.isHost(identity.applicationID)
+                    activity.descriptor.includes(applicationID)
+                        && (!onlyActivitiesHostedByLocal || activity.isHost(identity.applicationID))
                 }
                 .map(\.descriptor)
                 .filter(\.isActive)
@@ -1561,38 +1520,16 @@ private extension RoomCoordinator {
               descriptor.hostApplicationID == peer.applicationID,
               descriptor.includes(identity.applicationID) else { return }
 
-        let existing = session.activity(descriptor.id)
-        if let existing {
-            let current = existing.descriptor
-            guard descriptor.hostGeneration >= current.hostGeneration else { return }
-            if descriptor.hostGeneration == current.hostGeneration {
-                guard descriptor.hostApplicationID == current.hostApplicationID else { return }
-            } else {
-                guard descriptor.hostGeneration == current.hostGeneration + 1,
-                      connectedPeers[current.hostApplicationID] == nil,
-                      let election = RoomHostElection.successor(
-                          in: session.members.filter {
-                              current.includes($0.applicationID)
-                          },
-                          after: current.hostApplicationID,
-                          availableApplicationIDs: Set(connectedPeers.keys)
-                              .union([identity.applicationID])
-                      ),
-                      election.applicationID == peer.applicationID
-                else { return }
-            }
-        }
-
-        let isNewActivity = existing == nil
-        instantiateActivity(descriptor, in: session)
+        let isNewActivity = session.activity(descriptor.id) == nil
+        guard reconcileActivity(descriptor, from: peer, in: session) else { return }
 
         guard publishesNotice,
               isNewActivity,
               descriptor.state == .lobby,
               session.activity(descriptor.id) != nil else { return }
 
-        let hostDisplayName = session.member(descriptor.hostApplicationID)?.displayName ?? "El anfitrión"
-        noticeHandler?(.activityInvitation(P2PActivityInvitationNotice(
+        guard let hostDisplayName = session.member(descriptor.hostApplicationID)?.displayName else { return }
+        publishNotice(.activityInvitation(P2PActivityInvitationNotice(
             activityID: descriptor.id,
             roomID: descriptor.roomID,
             kind: descriptor.kind,
@@ -1604,13 +1541,25 @@ private extension RoomCoordinator {
         guard let session = sessions[payload.roomID],
               let activity = session.activity(payload.activityID),
               activity.isHost(identity.applicationID) else { return }
+        guard activity.descriptor.admitsRoomMembers || activity.descriptor.includes(peer.applicationID) else {
+            send(
+                .activityJoinRejected(ActivityRejectionPayload(
+                    roomID: payload.roomID,
+                    activityID: payload.activityID,
+                    reason: .hostRejected
+                )),
+                to: [peer.applicationID],
+                roomID: payload.roomID
+            )
+            return
+        }
 
         guard activity.descriptor.state == .lobby else {
             send(
                 .activityJoinRejected(ActivityRejectionPayload(
                     roomID: payload.roomID,
                     activityID: payload.activityID,
-                    reason: "La partida ya ha empezado."
+                    reason: .activityAlreadyStarted
                 )),
                 to: [peer.applicationID],
                 roomID: payload.roomID
@@ -1633,6 +1582,51 @@ private extension RoomCoordinator {
         )
     }
 
+    func validatesActivities(_ descriptors: [ActivityDescriptor], roomID: RoomID, members: [RoomMember]) -> Bool {
+        let memberIDs = Set(members.map(\.applicationID))
+        return descriptors.count <= P2PLimits.recoveryActivityLimit
+            && Set(descriptors.map(\.id)).count == descriptors.count
+            && descriptors.allSatisfy {
+                $0.roomID == roomID
+                    && $0.participantIDs.isSubset(of: memberIDs)
+                    && $0.includes($0.hostApplicationID)
+            }
+    }
+
+    @discardableResult
+    func reconcileActivity(_ descriptor: ActivityDescriptor, from peer: ConnectedPeer, in session: RoomSession) -> Bool {
+        guard session.features.hasActivities,
+              descriptor.includes(identity.applicationID),
+              validatesActivities([descriptor], roomID: session.roomID, members: session.members) else { return false }
+        if let activity = session.activity(descriptor.id) {
+            let current = activity.descriptor
+            guard descriptor.kind == current.kind,
+                  descriptor.admitsRoomMembers == current.admitsRoomMembers,
+                  descriptor.isExclusive == current.isExclusive,
+                  descriptor.hostApplicationID == peer.applicationID else { return false }
+            if descriptor.hostGeneration == current.hostGeneration {
+                guard descriptor.hostApplicationID == current.hostApplicationID else { return false }
+            } else {
+                guard current.hostGeneration < UInt64.max,
+                      descriptor.hostGeneration == current.hostGeneration + 1,
+                      current.hostApplicationID != identity.applicationID,
+                      connectedPeers[current.hostApplicationID] == nil,
+                      descriptor.participantIDs == current.participantIDs
+                          || descriptor.participantIDs == current.participantIDs.subtracting([current.hostApplicationID]),
+                      let election = RoomHostElection.successor(
+                          in: session.members.filter { current.includes($0.applicationID) },
+                          after: current.hostApplicationID,
+                          availableApplicationIDs: Set(connectedPeers.keys).union([identity.applicationID])
+                      ), election.applicationID == peer.applicationID else { return false }
+            }
+        } else {
+            guard descriptor.hostApplicationID == peer.applicationID
+                || session.descriptor.hostApplicationID == peer.applicationID else { return false }
+        }
+        instantiateActivity(descriptor, in: session)
+        return true
+    }
+
     func instantiateActivity(_ descriptor: ActivityDescriptor, in session: RoomSession) {
         if let existing = session.activity(descriptor.id) {
             // The same activity can arrive via `activityStarted` and later via
@@ -1642,8 +1636,12 @@ private extension RoomCoordinator {
             return
         }
 
-        guard let activity = registry.makeActivity(for: session.makeActivityContext(for: descriptor))
-        else { return }
+        guard let activity = registry.makeActivity(for: session.makeActivityContext(
+            for: descriptor,
+            endActivity: { [weak self] reason in
+                self?.endActivity(descriptor.id, in: descriptor.roomID, reason: reason)
+            }
+        )) else { return }
         session.register(activity)
         republishIfHosting(session)
     }
@@ -1651,8 +1649,13 @@ private extension RoomCoordinator {
 
 // MARK: - Mesh, advertisement and utilities
 
-@MainActor
+@NexoActor
 private extension RoomCoordinator {
+
+    func apply(_ members: [RoomMember], to session: RoomSession) {
+        session.apply(members: members)
+        transfers.reconcileMembers(in: session)
+    }
 
     func makeSession(descriptor: RoomDescriptor, accessState: RoomAccessState) -> RoomSession {
         let roomID = descriptor.id
@@ -1660,25 +1663,19 @@ private extension RoomCoordinator {
             roomID: roomID,
             transport: transport,
             identity: identity,
-            recipients: { [weak self] in
-                self?.sessions[roomID]?.remoteMembers.map(\.applicationID) ?? []
-            }
+            isPeerAdmitted: { [weak self] in self?.isPeerAdmitted($0) ?? false }
         )
 
         outboxes[roomID] = outbox
 
-        return RoomSession(
+        let session = RoomSession(
             descriptor: descriptor,
             identity: identity,
             outbox: outbox,
             accessState: accessState
         )
-    }
-
-    func reconcilePhysicalPeers() {
-        for peer in transport.connectedPeers {
-            handlePeerConnected(peer)
-        }
+        session.bindTransfers(transfers)
+        return session
     }
 
     /// Opens connections to a room's members who aren't connected yet. The
@@ -1716,7 +1713,7 @@ private extension RoomCoordinator {
         guard recoveryTasks[applicationID] == nil,
               recoveryDeadlines[applicationID] != nil else { return }
 
-        recoveryTasks[applicationID] = Task { @MainActor [weak self] in
+        recoveryTasks[applicationID] = Task { @NexoActor [weak self] in
             let delays: [Duration] = [
                 .zero,
                 .seconds(1),
@@ -1752,10 +1749,7 @@ private extension RoomCoordinator {
 
                 // `connect` waits for the physical handshake. If it succeeds,
                 // the `peerConnected` event cancels this task and triggers resume.
-                if let peer = try? await self.transport.connect(to: advertisement) {
-                    self.handlePeerConnected(peer)
-                    return
-                }
+                _ = try? await self.transport.connect(to: advertisement)
             }
 
             while !Task.isCancelled {
@@ -1778,10 +1772,7 @@ private extension RoomCoordinator {
                 guard let advertisement = self.advertisement(for: applicationID) else {
                     continue
                 }
-                if let peer = try? await self.transport.connect(to: advertisement) {
-                    self.handlePeerConnected(peer)
-                    return
-                }
+                _ = try? await self.transport.connect(to: advertisement)
             }
         }
     }
@@ -1804,20 +1795,23 @@ private extension RoomCoordinator {
             } else if session.descriptor.hostApplicationID == applicationID {
                 if !migrateRoomHost(after: applicationID, in: session) {
                     session.setAccessState(.reconnecting)
-                    session.chat?.appendSystemMessage("Se ha perdido la conexión con el anfitrión.")
-                    session.removeAllActivities(reason: "Se perdió la conexión con el anfitrión.")
+                    session.record(.hostConnectionLost)
+                    session.removeAllActivities(reason: .hostConnectionLost)
                 }
             } else {
                 migrateActivities(hostedBy: applicationID, in: session)
                 var members = session.members
                 members.removeAll { $0.applicationID == applicationID }
-                session.apply(members: members)
+                apply(members, to: session)
             }
         }
     }
 
     @discardableResult
     func migrateRoomHost(after failedHostApplicationID: String, in session: RoomSession) -> Bool {
+        guard session.descriptor.hostApplicationID == failedHostApplicationID,
+              session.descriptor.hostGeneration < UInt64.max,
+              connectedPeers[failedHostApplicationID] == nil else { return false }
         let available = Set(connectedPeers.keys).union([identity.applicationID])
         guard let election = RoomHostElection.successor(
             in: session.members,
@@ -1826,7 +1820,9 @@ private extension RoomCoordinator {
         ) else { return false }
 
         guard election.applicationID == identity.applicationID else {
+            migrateActivities(hostedBy: failedHostApplicationID, in: session)
             session.setAccessState(.reconnecting)
+            publishRooms()
             return true
         }
 
@@ -1841,23 +1837,16 @@ private extension RoomCoordinator {
             )
         }
 
+        let migratedIDs = prepareActivityMigration(after: failedHostApplicationID, in: session)
         var descriptor = session.descriptor
         descriptor.hostApplicationID = identity.applicationID
-        descriptor.hostGeneration &+= 1
+        descriptor.hostGeneration += 1
         descriptor.memberCount = members.count
         session.apply(descriptor: descriptor)
         session.setAccessState(.joined)
-        session.chat?.appendSystemMessage(String(localized: "El anfitrión de la sala ha cambiado."))
+        session.record(.hostChanged)
 
-        for activity in session.activities.values
-        where activity.descriptor.hostApplicationID == failedHostApplicationID {
-            var activityDescriptor = activity.descriptor
-            activityDescriptor.hostApplicationID = identity.applicationID
-            activityDescriptor.hostGeneration &+= 1
-            activity.apply(descriptor: activityDescriptor)
-        }
-
-        session.apply(members: members)
+        apply(members, to: session)
         let activities = session.activities.values.map(\.descriptor)
 
         let payload = RoomHostChangedPayload(
@@ -1868,15 +1857,49 @@ private extension RoomCoordinator {
             activities: activities
         )
         broadcast(.roomHostChanged(payload), in: session)
+        announceMigratedActivities(migratedIDs, in: session)
         connectToMembers(of: session)
         for member in session.remoteMembers {
             sendResume(of: session, to: member.applicationID)
         }
         publishAdvertisement()
+        publishRooms()
         return true
     }
 
+    func prepareActivityMigration(after failedHostApplicationID: String, in session: RoomSession) -> [ActivityID] {
+        var migratedIDs: [ActivityID] = []
+        let available = Set(connectedPeers.keys).union([identity.applicationID])
+        // Elect while the old membership still contains the failed participant.
+        for activity in session.activities.values where activity.isHost(failedHostApplicationID) {
+            guard activity.descriptor.hostGeneration < UInt64.max,
+                  let election = RoomHostElection.successor(
+                      in: session.members.filter { activity.descriptor.includes($0.applicationID) },
+                      after: failedHostApplicationID,
+                      availableApplicationIDs: available
+                  ) else { continue }
+            var descriptor = activity.descriptor
+            descriptor.hostApplicationID = election.applicationID
+            descriptor.hostGeneration += 1
+            activity.apply(descriptor: descriptor)
+            migratedIDs.append(activity.id)
+        }
+        return migratedIDs
+    }
+
+    func announceMigratedActivities(_ activityIDs: [ActivityID], in session: RoomSession) {
+        for activityID in activityIDs {
+            guard let activity = session.activity(activityID), activity.isHost(identity.applicationID) else { continue }
+            send(
+                .activityStarted(ActivityLifecyclePayload(descriptor: activity.descriptor)),
+                to: activity.descriptor.participantIDs.filter { $0 != identity.applicationID }.sorted(),
+                roomID: session.roomID
+            )
+        }
+    }
+
     func migrateActivities(hostedBy failedHostApplicationID: String, in session: RoomSession) {
+        guard connectedPeers[failedHostApplicationID] == nil else { return }
         let available = Set(connectedPeers.keys).union([identity.applicationID])
 
         for activity in session.activities.values
@@ -1884,15 +1907,16 @@ private extension RoomCoordinator {
             let participants = session.members.filter {
                 activity.descriptor.includes($0.applicationID)
             }
-            guard let election = RoomHostElection.successor(
-                in: participants,
-                after: failedHostApplicationID,
-                availableApplicationIDs: available
-            ), election.applicationID == identity.applicationID else { continue }
+            guard activity.descriptor.hostGeneration < UInt64.max,
+                  let election = RoomHostElection.successor(
+                      in: participants,
+                      after: failedHostApplicationID,
+                      availableApplicationIDs: available
+                  ), election.applicationID == identity.applicationID else { continue }
 
             var descriptor = activity.descriptor
             descriptor.hostApplicationID = identity.applicationID
-            descriptor.hostGeneration &+= 1
+            descriptor.hostGeneration += 1
             activity.apply(descriptor: descriptor)
             send(
                 .activityStarted(ActivityLifecyclePayload(descriptor: descriptor)),
@@ -1910,26 +1934,35 @@ private extension RoomCoordinator {
     }
 
     func advertisement(for applicationID: String) -> PeerAdvertisement? {
-        advertisements.values.first { $0.applicationID == applicationID }
+        directory.advertisement(for: applicationID)
     }
 
-    func endpointID(for applicationID: String) -> TransportPeerID? {
-        advertisement(for: applicationID)?.endpointID
-    }
-
-    func remember(_ messageID: UUID, for roomID: RoomID) -> Bool {
-        var ids = receivedEnvelopeIDs[roomID, default: []]
-        guard ids.insert(messageID).inserted else { return false }
-
-        var order = receivedEnvelopeOrder[roomID, default: []]
-        if order.count >= P2PLimits.recoveryJournalLimit,
-           let oldest = order.first {
-            order.removeFirst()
-            ids.remove(oldest)
+    func discardSession(_ roomID: RoomID, publishes: Bool = true) {
+        if let session = sessions.removeValue(forKey: roomID) {
+            transfers.cancelAll(in: session)
+            for member in session.remoteMembers {
+                cancelRecoveryIfUnused(for: member.applicationID)
+            }
         }
-        order.append(messageID)
-        receivedEnvelopeIDs[roomID] = ids
-        receivedEnvelopeOrder[roomID] = order
+        outboxes.removeValue(forKey: roomID)
+        if activeRoomID == roomID { activeRoomID = nil }
+        if publishes { publishRooms() }
+    }
+
+    func remember(_ messageID: UUID, from applicationID: String) -> Bool {
+        let key = ReceivedEnvelopeKey(sender: applicationID, messageID: messageID)
+        guard !receivedEnvelopeIDs.contains(key) else { return false }
+        // Directory envelopes carry arbitrary room IDs; never allocate a room bucket.
+        let perSenderLimit = P2PLimits.recoveryJournalLimit
+        if receivedEnvelopeOrder.lazy.filter({ $0.sender == applicationID }).count >= perSenderLimit,
+           let index = receivedEnvelopeOrder.firstIndex(where: { $0.sender == applicationID }) {
+            receivedEnvelopeIDs.remove(receivedEnvelopeOrder.remove(at: index))
+        }
+        if receivedEnvelopeOrder.count >= perSenderLimit * 4 {
+            receivedEnvelopeIDs.remove(receivedEnvelopeOrder.removeFirst())
+        }
+        receivedEnvelopeIDs.insert(key)
+        receivedEnvelopeOrder.append(key)
         return true
     }
 
@@ -1960,8 +1993,15 @@ private extension RoomCoordinator {
               envelope.payload.count <= P2PLimits.maximumEnvelopeBytes
         else { return }
 
-        for applicationID in applicationIDs where applicationID != identity.applicationID {
+        for applicationID in applicationIDs where isPeerAdmitted(applicationID) {
             transport.enqueue(envelope, to: applicationID)
+        }
+    }
+
+    func isPeerAdmitted(_ applicationID: String) -> Bool {
+        guard let peer = connectedPeers[applicationID], applicationID != identity.applicationID else { return false }
+        return transport.connectedPeers.contains {
+            $0.applicationID == applicationID && $0.connectionSessionID == peer.connectionSessionID
         }
     }
 
@@ -1969,33 +2009,124 @@ private extension RoomCoordinator {
         send(message, to: session.remoteMembers.map(\.applicationID), roomID: session.roomID)
     }
 
-    // MARK: Join continuations
+    // MARK: Join operations
 
-    func scheduleJoinTimeout(for roomID: RoomID) {
-        joinTimeoutTasks[roomID]?.cancel()
-        joinTimeoutTasks[roomID] = Task { @MainActor [weak self] in
+    func completeJoinConnection(to room: DiscoveredRoom, host: ConnectedPeer, requestID: UUID) {
+        guard let operation = pendingJoins[room.id], operation.id == requestID,
+              operation.roomToJoin != nil,
+              connectedPeers[host.applicationID]?.connectionSessionID == host.connectionSessionID else { return }
+        guard sessions[room.id]?.instanceID == operation.originalSessionInstanceID else {
+            finishJoin(room.id, requestID: requestID, result: .failure(RoomError.roomNotFound))
+            return
+        }
+        if let previous = sessions[room.id] {
+            guard previous.descriptor.hostApplicationID == room.descriptor.hostApplicationID,
+                  previous.descriptor.hostGeneration == room.descriptor.hostGeneration else {
+                finishJoin(room.id, requestID: requestID, result: .failure(RoomError.peerUnavailable))
+                return
+            }
+        }
+        guard host.applicationID == room.descriptor.hostApplicationID else {
+            finishJoin(room.id, requestID: requestID, result: .failure(RoomError.peerUnavailable))
+            return
+        }
+        guard host.supports(.rooms) else {
+            finishJoin(room.id, requestID: requestID, result: .failure(RoomError.incompatibleProtocol(host.protocolVersion)))
+            return
+        }
+        pendingJoins[room.id]?.roomToJoin = nil
+        if let previous = sessions[room.id] {
+            previous.removeAllActivities(reason: .sessionEnded)
+            previous.setAccessState(.closed(reason: .sessionEnded))
+            discardSession(room.id, publishes: false)
+        }
+        let session = makeSession(descriptor: room.descriptor, accessState: .awaitingApproval)
+        sessions[room.id] = session
+        pendingJoins[room.id]?.sessionInstanceID = session.instanceID
+        pendingJoins[room.id]?.connectionSessionID = host.connectionSessionID
+        activeRoomID = room.id
+        publishRooms()
+        sendJoinRequest(roomID: room.id, to: host.applicationID, requestID: requestID)
+    }
+
+    func beginRecoveryJoin(in session: RoomSession, from peer: ConnectedPeer) {
+        guard pendingJoins[session.roomID] == nil,
+              session.contains(identity.applicationID) else { return }
+        let requestID = UUID()
+        pendingJoins[session.roomID] = PendingJoin(
+            id: requestID,
+            hostApplicationID: peer.applicationID,
+            continuation: nil,
+            isRecovery: true,
+            connectionSessionID: peer.connectionSessionID,
+            sessionInstanceID: session.instanceID
+        )
+        scheduleJoinTimeout(for: session.roomID, requestID: requestID)
+        sendJoinRequest(roomID: session.roomID, to: peer.applicationID, requestID: requestID)
+    }
+
+    func sendJoinRequest(roomID: RoomID, to applicationID: String, requestID: UUID) {
+        send(
+            .joinRoomRequest(JoinRoomRequestPayload(
+                roomID: roomID,
+                displayName: identity.displayName,
+                avatar: identity.avatar,
+                requestID: requestID
+            )),
+            to: [applicationID],
+            roomID: roomID
+        )
+    }
+
+    func matchesPendingJoin(_ roomID: RoomID, requestID: UUID?, from peer: ConnectedPeer) -> Bool {
+        guard let requestID, let operation = pendingJoins[roomID] else { return false }
+        return operation.id == requestID
+            && operation.hostApplicationID == peer.applicationID
+            && operation.connectionSessionID == peer.connectionSessionID
+            && operation.sessionInstanceID == sessions[roomID]?.instanceID
+            && operation.sessionInstanceID != nil
+    }
+
+    func scheduleJoinTimeout(for roomID: RoomID, requestID: UUID) {
+        pendingJoins[roomID]?.timeoutTask = Task { @NexoActor [weak self] in
             do {
                 try await Task.sleep(for: P2PLimits.joinTimeout)
             } catch {
                 return
             }
-            self?.finishJoin(roomID, result: .failure(RoomError.joinTimedOut))
+            self?.finishJoin(roomID, requestID: requestID, result: .failure(RoomError.joinTimedOut))
         }
     }
 
-    func finishJoin(_ roomID: RoomID, result: Result<RoomSession, Error>) {
-        joinTimeoutTasks.removeValue(forKey: roomID)?.cancel()
-        guard let continuation = joinContinuations.removeValue(forKey: roomID) else { return }
+    func finishJoin(
+        _ roomID: RoomID,
+        requestID: UUID? = nil,
+        result: Result<RoomSession, Error>,
+        publishes: Bool = true
+    ) {
+        guard let operation = pendingJoins[roomID],
+              requestID == nil || operation.id == requestID else { return }
+        pendingJoins.removeValue(forKey: roomID)
+        operation.connectionTask?.cancel()
+        operation.timeoutTask?.cancel()
 
         switch result {
         case .success(let session):
-            continuation.resume(returning: session)
+            operation.continuation?.resume(returning: session)
         case .failure(let error):
-            // A failed join must not leave a ghost session in the registry.
-            if sessions[roomID]?.accessState == .awaitingApproval {
-                sessions.removeValue(forKey: roomID)
+            if let session = sessions[roomID], session.instanceID == operation.sessionInstanceID {
+                if operation.isRecovery {
+                    if session.accessState == .suspended { session.setAccessState(.reconnecting) }
+                } else {
+                    if connectedPeers[operation.hostApplicationID]?.connectionSessionID == operation.connectionSessionID {
+                        send(.leaveRoom(LeaveRoomPayload(roomID: roomID)), to: [operation.hostApplicationID], roomID: roomID)
+                    }
+                    session.removeAllActivities(reason: .sessionEnded)
+                    session.setAccessState(.closed(reason: NexoReason(error: error)))
+                    discardSession(roomID, publishes: publishes)
+                }
             }
-            continuation.resume(throwing: error)
+            operation.continuation?.resume(throwing: error)
         }
     }
 }
