@@ -1,22 +1,20 @@
-//
-//  RoomDirectory.swift
-//  Nexo
-//
-
 import Foundation
 
+/// Directorio de salas descubiertas por anuncios de peers cercanos. Trabaja sobre
+/// su propio estado (anuncios + salas), con acoplamiento mínimo al resto de la
+/// capa de salas.
 struct RoomDirectory {
     private(set) var advertisements: [TransportPeerID: PeerAdvertisement] = [:]
     private(set) var rooms: [RoomID: DiscoveredRoom] = [:]
 
     mutating func update(_ advertisement: PeerAdvertisement) {
         advertisements[advertisement.endpointID] = advertisement
-        guard advertisement.isCompatible, let hostApplicationID = advertisement.applicationID else {
+        guard advertisement.isCompatible, let hostDeviceID = advertisement.deviceID else {
             removeRooms(advertisedBy: advertisement.endpointID, except: [])
             return
         }
         let descriptors = advertisement.rooms.filter {
-            Self.isValid($0, hostApplicationID: hostApplicationID)
+            Self.isValid($0, hostDeviceID: hostDeviceID)
         }
         for descriptor in descriptors {
             upsert(descriptor, endpointID: advertisement.endpointID, hostDisplayName: advertisement.displayName)
@@ -26,9 +24,13 @@ struct RoomDirectory {
         }
     }
 
-    mutating func update(_ payload: RoomDirectoryPayload, from peer: ConnectedPeer, joinedIDs: Set<RoomID>) -> Set<RoomID>? {
-        guard let endpointID = advertisement(for: peer.applicationID)?.endpointID,
-              payload.rooms.allSatisfy({ Self.isValid($0, hostApplicationID: peer.applicationID) }),
+    mutating func update(
+        _ payload: RoomDirectoryPayload,
+        from peer: ConnectedPeer,
+        joinedIDs: Set<RoomID>
+    ) -> Set<RoomID>? {
+        guard let endpointID = advertisement(for: peer.deviceID)?.endpointID,
+              payload.rooms.allSatisfy({ Self.isValid($0, hostDeviceID: peer.deviceID) }),
               Set(payload.rooms.map(\.id)).count == payload.rooms.count else { return nil }
         let descriptors = payload.rooms
         let ids = Set(descriptors.map(\.id))
@@ -58,17 +60,16 @@ struct RoomDirectory {
         rooms.removeAll()
     }
 
-    func advertisement(for applicationID: String) -> PeerAdvertisement? {
-        advertisements.values.first { $0.applicationID == applicationID }
+    func advertisement(for deviceID: DeviceID) -> PeerAdvertisement? {
+        advertisements.values.first { $0.deviceID == deviceID }
     }
 
-    private static func isValid(_ descriptor: RoomDescriptor, hostApplicationID: String) -> Bool {
-        descriptor.hostApplicationID == hostApplicationID
-            && !hostApplicationID.isEmpty
+    private static func isValid(_ descriptor: RoomDescriptor, hostDeviceID: DeviceID) -> Bool {
+        descriptor.hostDeviceID == hostDeviceID
             && descriptor.memberCount > 0
-            && descriptor.memberCount <= P2PLimits.recoveryMemberLimit
+            && descriptor.memberCount <= Limits.recoveryMemberLimit
             && (descriptor.capacity.map { $0 > 0 && descriptor.memberCount <= $0 } ?? true)
-            && P2PProtocolInfo.isCompatible(remoteVersion: descriptor.protocolVersion)
+            && ProtocolInfo.isCompatible(remoteVersion: descriptor.protocolVersion)
     }
 
     private mutating func upsert(_ descriptor: RoomDescriptor, endpointID: TransportPeerID, hostDisplayName: String) {

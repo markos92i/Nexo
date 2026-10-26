@@ -4,126 +4,141 @@
 ![iOS 26+](https://img.shields.io/badge/iOS-26%2B-007AFF)
 ![SPM](https://img.shields.io/badge/SPM-Compatible-blue)
 
-A peer-to-peer rooms library for iOS built on Network framework's structured API (Bonjour + TCP). Nexo handles discovery, connections, room membership and typed message delivery — it has no idea what a chat message or a game move looks like. That part is entirely up to you.
+Librería P2P para iOS/macOS construida sobre Network framework (Bonjour + TCP, y
+QUIC para streaming binario). Nexo resuelve lo **estándar** de cualquier app P2P
+—descubrimiento, conexiones cifradas, salas de N participantes, coordinación de
+host y su migración automática, entrega de mensajes y recuperación tras caídas— y
+deja que **cada app** defina lo suyo encima: qué son los mensajes, cómo se
+orquesta un juego y a quién se envía cada cosa.
 
-## What Nexo knows about
+Nexo no sabe qué es un chat, un sudoku o un movimiento de ajedrez. Eso lo pones tú.
 
-- **Transport** — Bonjour advertising/browsing, one physical connection per peer, reconnection handling. `PeerTransport` is a protocol, so the default `NetworkPeerTransport` can be swapped in tests.
-- **Rooms** — logical spaces that survive reconnects. A room is not a socket: several rooms can share the same physical connection to a peer, and a room's membership, host authority and features (`chat`, `activities`, `fileTransfer`) are independent of the transport.
-- **Activities** — anything that happens *inside* a room. An activity's payload is opaque `Data` to every layer below it; Nexo only routes it to the right `RoomActivity` instance. Activities can be `isExclusive` (a game — only one at a time) or not (e.g. chat, which can run alongside anything).
-- **Delivery** — reliable in-order envelopes by default, plus a `coalescingKey` for latest-wins state (board snapshots, cursor positions) so a stale update never sits in front of an authoritative one.
+## Qué resuelve Nexo (estándar)
 
-## What Nexo does **not** know about
+- **Transporte** — descubrimiento Bonjour, una conexión física por peer,
+  reconexión. `Transport` es un protocolo, así que el `NetworkTransport` por
+  defecto se puede sustituir por un mock en tests.
+- **Cifrado PSK** — el canal se cifra con una clave precompartida derivada de un
+  secreto de app (y opcionalmente un código de sala). Sin certificados, sin
+  servidor. Quien no conoce el secreto no completa el handshake.
+- **Salas** — espacios lógicos de N participantes que sobreviven a reconexiones.
+  Una sala no es un socket: varias salas comparten la conexión física a un peer, y
+  la membresía, la autoridad de host y las capacidades (`chat`, `activities`,
+  `fileTransfer`) son independientes del transporte.
+- **Host interno y migración** — alguien es la autoridad de la sala (admite
+  miembros, lista canónica). Si cae, otro toma el relevo automáticamente sin que la
+  app lo note. La partida no se cae.
+- **Entrega** — mensajes fiables y en orden por defecto, más estado reemplazable
+  (`coalescingKey`) latest-wins para snapshots (tablero, posiciones) que nunca
+  quedan detrás de una orden autoritativa. Destino explícito por mensaje: a uno, a
+  varios o a todos.
+- **Recuperación** — journal con replay idempotente por `messageID`, para que una
+  caída breve de Wi-Fi no rompa el hilo.
 
-Sudoku, chess, chat bubbles, display names' language, or any other product concept. Every one of those is built on top, in your app, using the extension points below.
+## Qué pone tu app encima
 
-## Installation
+- Los **mensajes**: Nexo transporta `Data` opaco; tu juego define su propio enum
+  `Codable` y Nexo ni lo mira.
+- La **orquestación** del juego: turnos, reglas, inicio y fin de partida, y quién
+  es el árbitro (si lo necesitas). La autoridad del *juego* es tuya; el host de
+  Nexo solo mantiene viva la *sala*.
+- **A quién** se envía cada cosa (optimización y privacidad).
 
-Add Nexo as a local Swift package and link the `Nexo` product to your app target.
-
-## Core types
+## Arquitectura
 
 ```
-PeerTransport            neutral transport contract (NetworkPeerTransport implements it)
-└── RoomCoordinator      logical rooms: discovery, membership, host authority
-    └── RoomSession      one room: members + live activities
-        └── RoomActivity one instance per activity (chat, a game, ...)
+Transport            contrato de transporte neutral (NetworkTransport lo implementa)
+└── RoomService      salas lógicas: descubrimiento, membresía, host, recuperación
+    └── Room         una sala: miembros + chat + actividades vivas
+        └── Activity una instancia por actividad (chat, un juego, ...)
 ```
 
-- `RoomOutbox` is the only way to send — it's scoped to one room, so nothing you write can leak a message into the wrong room.
-- `ActivityKind` is an open, `String`-backed identifier. Nexo ships none. Your app declares its own:
+Capas con dependencias solo hacia abajo: el transporte no sabe qué es una sala; la
+sala no sabe qué es un juego.
+
+## Instalación
+
+Añade Nexo como paquete Swift local y enlaza el producto `Nexo` a tu target.
+
+## Puesta en marcha
 
 ```swift
-extension ActivityKind {
-    static let sudoku = ActivityKind("sudoku")
+import Nexo
+
+// 1. Identidad de dispositivo (la genera y persiste Nexo en Keychain)
+let identity = try LocalIdentity.loadOrCreate(displayName: UIDevice.current.name)
+
+// 2. Cifrado PSK: secreto de app (constante tuya) + opcional código de sala
+let crypto = SessionCrypto(appSecret: "mi-secreto-de-app")
+
+// 3. Transporte y servicio de salas
+let transport = NetworkTransport(crypto: crypto, deviceID: identity.deviceID,
+                                 displayName: identity.displayName)
+let rooms = RoomService(transport: transport, identity: identity)
+
+transport.start(advertising: true, browsing: true)
+```
+
+## Crear una actividad (juego)
+
+```swift
+// 1. Identificador del tipo
+extension ActivityKind { static let sudoku = ActivityKind("sudoku") }
+
+// 2. Mensajes del juego (opacos para Nexo)
+enum SudokuMessage: Codable, Sendable {
+    case move(row: Int, col: Int, value: Int)
+    case board(SudokuBoard)
 }
-```
 
-## Adding a new activity
-
-1. Define a `Codable` message enum for it. It travels as opaque payload; no other layer needs to know about it.
-2. Subclass `GenericActivity<YourMessage>` — it already handles decoding, buffering messages that arrive before your UI is ready, and coalesced sending.
-3. Register a factory:
-
-```swift
-RoomActivityRegistry.shared.register(.yourKind) { context in
-    YourActivity(context: context)
+// 3. Subclase de GenericActivity
+final class SudokuActivity: GenericActivity<SudokuMessage> {
+    override func currentStateSnapshot() -> SudokuMessage? { .board(currentBoard) }
 }
+
+// 4. Registrar la fábrica
+rooms.registerActivity(.sudoku) { context in SudokuActivity(context: context) }
 ```
 
-No change to the transport, the envelope format, or `RoomCoordinator` is ever required.
-
-## Design notes
-
-- Peers identify themselves with a self-declared `applicationID` — it is **not verified**. Treat every remote payload as untrusted.
-- `NetworkPeerTransport` encrypts traffic when supplied with `NexoTLSConfiguration`; the Zafir app creates that configuration automatically for every device.
-- Bonjour TXT records are capped at 255 bytes per entry — anything published there is budgeted in UTF-8 bytes.
-
-## Documentation
-
-- **[USAGE.md](USAGE.md)** — Complete usage guide with examples for permissions, TLS, verification, rooms, chat, file transfer, and activities.
-- **[Security](Sources/Nexo/Documentation.docc/Security.md)** — TOFU encryption model, identity verification, and security best practices.
-- **[Communication Architecture](Sources/Nexo/Documentation.docc/CommunicationArchitecture.md)** — Hybrid TCP/JSON + QUIC/binary transport design.
-
-## Permissions
-
-Before using Nexo, check that Local Network permission is granted:
+Enviar con destino explícito:
 
 ```swift
-let checker = NexoPermissionsChecker()
+activity.send(.move(row: 0, col: 1, value: 5), to: .everyone)   // a todos
+activity.send(secret, to: .member(rivalDeviceID))               // a uno
+activity.sendState(.board(board), coalescingKey: "board")       // estado reemplazable
+```
+
+## Seguridad
+
+El modelo es **secreto compartido**: quien conoce `appSecret` (+ `roomCode` si se
+usa) entra y descifra; quien no, no completa el handshake. No hay identidad
+criptográfica por dispositivo ni verificación TOFU: comparar el código de sala en
+persona ES la verificación. Trata todo payload remoto como no confiable.
+
+## Permisos
+
+```swift
+let checker = PermissionsChecker()
 await checker.checkPermissions()
-
 if checker.status.hasCriticalDenial {
-    let guidance = checker.settingsGuidance
-    // Show guidance.title, guidance.message, guidance.steps
+    // Mostrar checker.settingsGuidance (title/steps/settingsURL)
 }
 ```
 
-## Peer Verification (TOFU)
+Info.plist:
 
-Nexo uses Trust On First Use, similar to SSH:
-
-```swift
-let verificationService = NexoPeerVerificationService(applicationID: myID)
-
-// Check peer state
-let state = verificationService.verify(connectedPeer)
-
-switch state {
-case .unknown:
-    // First connection - show acceptance UI
-case .trustedOnFirstUse:
-    // Known peer, encrypted connection
-case .verified:
-    // Peer verified out-of-band
-case .identityChanged:
-    // ⚠️ Fingerprint changed - possible MITM
-}
-
-// Visual fingerprint for verification
-let info = verificationService.identityInfo(for: peer)
-print(info.emojiFingerprint)  // "🍎🐶🌸⭐🍇🦊🌻🌙"
+```xml
+<key>NSLocalNetworkUsageDescription</key>
+<string>Nexo necesita la red local para descubrir dispositivos cercanos.</string>
+<key>NSBonjourServices</key>
+<array>
+    <string>_nexo._tcp</string>
+    <string>_nexo._udp</string>
+</array>
 ```
 
-## Local P2P identity
+## Documentación
 
-The normal app flow requires no backend or certificate bundle. `NexoLocalTLSIdentity.loadOrCreate(applicationID:)` generates a P-256 key in Keychain, creates a self-signed X.509 certificate locally, and exposes the resulting `sec_identity_t` through `makeTLSConfiguration()`. The private key never leaves the device.
-
-The encrypted handshake exchanges the certificate public-key fingerprint. The app stores fingerprints accepted from the room menu in Keychain. TLS protects an unpaired connection, but the room lock is shown as verified only after every remote participant has been paired locally.
-
-## Managed-fleet TLS
-
-For a controlled device fleet, use a private CA and issue one mTLS identity per device. The generator at `Scripts/generate-production-pki.sh` writes credentials outside the repository by default and refuses to overwrite an existing output directory.
-
-```sh
-Scripts/generate-production-pki.sh /secure/path/nexo-production zafir-device-01
-```
-
-Distribute only the device `.p12` and its password to that device. Keep the CA private key offline or in a secrets manager, and distribute only `NexoProductionCA.cert.pem` to the application. Import the identity into Keychain, convert it with `sec_identity_create`, and configure Nexo with a validator that trusts this CA or pins the device public key. Do not ship the CA private key, password files, or generated PKCS#12 files in the app source tree.
-
-The generated leaf certificate has `serverAuth` and `clientAuth` EKUs and these SANs:
-
-- `urn:zafir:nexo:device:<device-name>`
-- `<device-name>.local`
-
-Generate a new leaf for every device. Do not reuse `zafir-device-01` credentials across the fleet.
+- **[USAGE.md](USAGE.md)** — guía de uso con ejemplos.
+- **[Seguridad](Sources/Nexo/Documentation.docc/Security.md)** — modelo PSK.
+- **[Arquitectura de comunicación](Sources/Nexo/Documentation.docc/CommunicationArchitecture.md)**.

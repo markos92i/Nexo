@@ -1,15 +1,10 @@
-//
-//  RoomModels.swift
-//  Nexo
-//
-
 import Foundation
 
 // MARK: - RoomID
 
-/// Logical identifier for a room, independent of transport: it doesn't derive
-/// from a Bonjour endpoint or a specific connection, so it survives
-/// reconnects and can travel inside messages.
+/// Identificador lógico de una sala, independiente del transporte: no deriva de
+/// un endpoint de Bonjour ni de una conexión concreta, así que sobrevive a
+/// reconexiones y puede viajar dentro de los mensajes.
 public struct RoomID: Hashable, Codable, Sendable, Identifiable, CustomStringConvertible {
     public let rawValue: UUID
 
@@ -17,7 +12,7 @@ public struct RoomID: Hashable, Codable, Sendable, Identifiable, CustomStringCon
         self.rawValue = rawValue
     }
 
-    /// Reconstructs a `RoomID` published in a TXT record or a message.
+    /// Reconstruye un `RoomID` publicado en un TXT o un mensaje.
     public init?(string: String) {
         guard let uuid = UUID(uuidString: string) else { return nil }
         self.rawValue = uuid
@@ -26,7 +21,8 @@ public struct RoomID: Hashable, Codable, Sendable, Identifiable, CustomStringCon
     public var id: UUID { rawValue }
     public var description: String { rawValue.uuidString }
 
-    /// Short form for debugging or as a human-readable room code.
+    /// Forma corta para depuración o como código de sala legible. Es también el
+    /// `roomCode` por defecto del que se deriva la PSK de la sala.
     public var shortCode: String {
         String(rawValue.uuidString.prefix(8))
     }
@@ -35,7 +31,7 @@ public struct RoomID: Hashable, Codable, Sendable, Identifiable, CustomStringCon
 // MARK: - RoomRole
 
 public enum RoomRole: String, Codable, Sendable {
-    /// Authority for the room: admits members, closes it, arbitrates activities.
+    /// Autoridad de la sala: admite miembros, la cierra, arbitra actividades.
     case host
     case guest
 }
@@ -43,19 +39,18 @@ public enum RoomRole: String, Codable, Sendable {
 // MARK: - RoomAccessPolicy
 
 public enum RoomAccessPolicy: String, Codable, Sendable, CaseIterable {
-    /// Any peer that discovers the room joins directly.
+    /// Cualquier peer que descubra la sala entra directamente.
     case open
-    /// The host must approve every join request.
+    /// El host debe aprobar cada solicitud de entrada.
     case approval
-
 }
 
 // MARK: - RoomFeatures
 
-/// Capabilities active in a given room.
+/// Capacidades activas en una sala dada.
 ///
-/// This is what makes the model flexible: a chat-only room, a game-only room
-/// and a mixed room are the same entity with different flags.
+/// Es lo que hace flexible el modelo: una sala solo-chat, una solo-juego y una
+/// mixta son la misma entidad con distintos flags.
 public struct RoomFeatures: OptionSet, Codable, Sendable, Hashable {
     public let rawValue: UInt16
 
@@ -79,23 +74,23 @@ public struct RoomFeatures: OptionSet, Codable, Sendable, Hashable {
 // MARK: - RoomMember
 
 public struct RoomMember: Codable, Hashable, Sendable, Identifiable {
-    /// Stable identity of the remote installation, not a transport ID.
-    public let applicationID: String
+    /// Identidad estable de la instalación remota, no un ID de transporte.
+    public let deviceID: DeviceID
     public let displayName: String
     public let role: RoomRole
-    /// Opaque avatar token chosen by the peer (catalog key or encoded
-    /// thumbnail). Absent in peers predating the field.
+    /// Token de avatar opaco elegido por el peer (clave de catálogo o miniatura
+    /// codificada). Ausente en peers anteriores a este campo.
     public let avatar: String?
 
-    public var id: String { applicationID }
+    public var id: DeviceID { deviceID }
 
     public init(
-        applicationID: String,
+        deviceID: DeviceID,
         displayName: String,
         role: RoomRole,
         avatar: String? = nil
     ) {
-        self.applicationID = applicationID
+        self.deviceID = deviceID
         self.displayName = displayName
         self.role = role
         self.avatar = avatar
@@ -106,39 +101,39 @@ public struct RoomMember: Codable, Hashable, Sendable, Identifiable {
 
 // MARK: - RoomDescriptor
 
-/// Transportable description of a room. Contains no Network framework types.
+/// Descripción transportable de una sala. No contiene tipos de Network framework.
 public struct RoomDescriptor: Codable, Hashable, Sendable, Identifiable {
     public let id: RoomID
     public var name: String
-    /// Application identity of the host that created and governs it.
-    public var hostApplicationID: String
-    /// Increased whenever authority moves to another room member.
+    /// Identidad del dispositivo host que la creó y gobierna.
+    public var hostDeviceID: DeviceID
+    /// Se incrementa cada vez que la autoridad pasa a otro miembro de la sala.
     public var hostGeneration: UInt64
     public var features: RoomFeatures
-    /// Primary intended activity. A game room declares this so discovery can
-    /// filter by game without connecting.
+    /// Actividad principal prevista. Una sala de juego la declara para que el
+    /// descubrimiento pueda filtrar por juego sin conectar.
     public var activityKind: ActivityKind?
     public var accessPolicy: RoomAccessPolicy
     public var memberCount: Int
-    /// `nil` means no limit declared by the product.
+    /// `nil` significa que el producto no declaró límite.
     public var capacity: Int?
     public let protocolVersion: UInt8
 
     public init(
         id: RoomID = RoomID(),
         name: String,
-        hostApplicationID: String,
+        hostDeviceID: DeviceID,
         features: RoomFeatures,
         activityKind: ActivityKind? = nil,
         accessPolicy: RoomAccessPolicy = .open,
         memberCount: Int = 1,
         capacity: Int? = nil,
         hostGeneration: UInt64 = 0,
-        protocolVersion: UInt8 = P2PProtocolInfo.currentVersion
+        protocolVersion: UInt8 = ProtocolInfo.currentVersion
     ) {
         self.id = id
         self.name = name
-        self.hostApplicationID = hostApplicationID
+        self.hostDeviceID = hostDeviceID
         self.hostGeneration = hostGeneration
         self.features = features
         self.activityKind = activityKind
@@ -149,15 +144,15 @@ public struct RoomDescriptor: Codable, Hashable, Sendable, Identifiable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, hostApplicationID, hostGeneration, features, activityKind
+        case id, name, hostDeviceID, hostGeneration, features, activityKind
         case accessPolicy, memberCount, capacity, protocolVersion
     }
 
-    public init(from decoder: Decoder) throws {
+    public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(RoomID.self, forKey: .id)
         name = try container.decode(String.self, forKey: .name)
-        hostApplicationID = try container.decode(String.self, forKey: .hostApplicationID)
+        hostDeviceID = try container.decode(DeviceID.self, forKey: .hostDeviceID)
         hostGeneration = try container.decodeIfPresent(UInt64.self, forKey: .hostGeneration) ?? 0
         features = try container.decode(RoomFeatures.self, forKey: .features)
         activityKind = try container.decodeIfPresent(ActivityKind.self, forKey: .activityKind)
@@ -177,33 +172,33 @@ public struct RoomDescriptor: Codable, Hashable, Sendable, Identifiable {
 
 // MARK: - RoomAccessState
 
-/// State of the local user's relationship with a room.
+/// Estado de la relación del usuario local con una sala.
 public enum RoomAccessState: Equatable, Sendable {
-    /// Discovered but not requested.
+    /// Descubierta pero no solicitada.
     case available
-    /// Request sent, awaiting the host's decision.
+    /// Solicitud enviada, esperando decisión del host.
     case awaitingApproval
     case joined
-    /// The physical connection to the host is suspended (e.g. backgrounded).
+    /// La conexión física al host está suspendida (p. ej. en segundo plano).
     case suspended
-    /// Retrying to recover membership.
+    /// Reintentando recuperar la membresía.
     case reconnecting
-    /// The host rejected entry or removed the member.
-    case rejected(reason: NexoReason)
-    /// The room closed or the host disappeared.
-    case closed(reason: NexoReason)
+    /// El host rechazó la entrada o expulsó al miembro.
+    case rejected(reason: DisconnectReason)
+    /// La sala se cerró o el host desapareció.
+    case closed(reason: DisconnectReason)
 
     public var isUsable: Bool { self == .joined }
 }
 
 // MARK: - RoomJoinRequest
 
-/// A pending join request. Scoped per room, not global: a host can have
-/// several rooms with independent queues.
+/// Solicitud de entrada pendiente. Está acotada por sala, no es global: un host
+/// puede tener varias salas con colas independientes.
 public struct RoomJoinRequest: Identifiable, Sendable, Equatable {
     public let id: UUID
     public let roomID: RoomID
-    public let applicationID: String
+    public let deviceID: DeviceID
     public let displayName: String
     public let avatar: String?
     public let receivedAt: Date
@@ -213,7 +208,7 @@ public struct RoomJoinRequest: Identifiable, Sendable, Equatable {
     public init(
         id: UUID = UUID(),
         roomID: RoomID,
-        applicationID: String,
+        deviceID: DeviceID,
         displayName: String,
         avatar: String? = nil,
         receivedAt: Date = Date(),
@@ -222,7 +217,7 @@ public struct RoomJoinRequest: Identifiable, Sendable, Equatable {
     ) {
         self.id = id
         self.roomID = roomID
-        self.applicationID = applicationID
+        self.deviceID = deviceID
         self.displayName = displayName
         self.avatar = avatar
         self.receivedAt = receivedAt
@@ -233,11 +228,11 @@ public struct RoomJoinRequest: Identifiable, Sendable, Equatable {
 
 // MARK: - DiscoveredRoom
 
-/// A room advertised by a nearby peer, not yet joined. Combines the published
-/// descriptor with the transport identifier needed to connect.
+/// Una sala anunciada por un peer cercano, aún no unida. Combina el descriptor
+/// publicado con el identificador de transporte necesario para conectar.
 public struct DiscoveredRoom: Identifiable, Sendable, Equatable {
     public let descriptor: RoomDescriptor
-    /// Peer advertising the room. May be the host or a member relaying it.
+    /// Peer que anuncia la sala. Puede ser el host o un miembro que la retransmite.
     public let advertisedBy: TransportPeerID
     public let hostDisplayName: String
     public let discoveredAt: Date

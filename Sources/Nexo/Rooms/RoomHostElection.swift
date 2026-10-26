@@ -1,33 +1,31 @@
 import Foundation
 
-struct RoomHostElection {
+/// Elección determinista del sucesor del host cuando el actual se vuelve
+/// inalcanzable. Todos los miembros calculan el mismo resultado a partir del
+/// mismo orden de miembros, sin negociación.
+enum RoomHostElection {
     struct Result: Equatable {
-        let applicationID: String
-        let skippedApplicationIDs: [String]
+        let deviceID: DeviceID
+        let skippedDeviceIDs: [DeviceID]
     }
 
     static func successor(
         in members: [RoomMember],
-        after failedHostApplicationID: String,
-        availableApplicationIDs: Set<String>
+        after failedHostDeviceID: DeviceID,
+        availableDeviceIDs: Set<DeviceID>
     ) -> Result? {
         guard !members.isEmpty,
-              let failedIndex = members.firstIndex(where: {
-                  $0.applicationID == failedHostApplicationID
-              })
+              let failedIndex = members.firstIndex(where: { $0.deviceID == failedHostDeviceID })
         else { return nil }
 
-        var skipped: [String] = []
+        var skipped: [DeviceID] = []
         for offset in 1..<members.count {
-            let applicationID = members[(failedIndex + offset) % members.count].applicationID
-            guard applicationID != failedHostApplicationID else { continue }
-            if availableApplicationIDs.contains(applicationID) {
-                return Result(
-                    applicationID: applicationID,
-                    skippedApplicationIDs: skipped
-                )
+            let deviceID = members[(failedIndex + offset) % members.count].deviceID
+            guard deviceID != failedHostDeviceID else { continue }
+            if availableDeviceIDs.contains(deviceID) {
+                return Result(deviceID: deviceID, skippedDeviceIDs: skipped)
             }
-            skipped.append(applicationID)
+            skipped.append(deviceID)
         }
         return nil
     }
@@ -35,12 +33,12 @@ struct RoomHostElection {
     static func validates(
         _ result: Result,
         in members: [RoomMember],
-        after failedHostApplicationID: String
+        after failedHostDeviceID: DeviceID
     ) -> Bool {
         guard let expected = successor(
             in: members,
-            after: failedHostApplicationID,
-            availableApplicationIDs: [result.applicationID]
+            after: failedHostDeviceID,
+            availableDeviceIDs: [result.deviceID]
         ) else { return false }
         return expected == result
     }

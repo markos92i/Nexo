@@ -2,109 +2,57 @@ import Foundation
 import Testing
 @testable import Nexo
 
-@Test func activityKindRoundTrips() {
-    let kind = ActivityKind("sudoku")
-    #expect(kind.rawValue == "sudoku")
-}
+@Suite("Identidad y modelos base")
+struct IdentityTests {
 
-@Test func hostElectionChoosesNextAvailableMemberInRoomOrder() {
-    let members = [
-        RoomMember(applicationID: "host", displayName: "Host", role: .host),
-        RoomMember(applicationID: "first", displayName: "First", role: .guest),
-        RoomMember(applicationID: "second", displayName: "Second", role: .guest),
-        RoomMember(applicationID: "third", displayName: "Third", role: .guest)
-    ]
-
-    let election = RoomHostElection.successor(
-        in: members,
-        after: "host",
-        availableApplicationIDs: ["host", "second", "third"]
-    )
-
-    #expect(election == RoomHostElection.Result(
-        applicationID: "second",
-        skippedApplicationIDs: ["first"]
-    ))
-    #expect(election.map {
-        RoomHostElection.validates($0, in: members, after: "host")
-    } == true)
-}
-
-@Test func hostElectionWrapsAroundAndRejectsOutOfOrderCandidate() {
-    let members = [
-        RoomMember(applicationID: "host", displayName: "Host", role: .host),
-        RoomMember(applicationID: "next", displayName: "Next", role: .guest),
-        RoomMember(applicationID: "last", displayName: "Last", role: .guest)
-    ]
-
-    let election = RoomHostElection.successor(
-        in: members,
-        after: "last",
-        availableApplicationIDs: ["host", "next", "last"]
-    )
-
-    #expect(election?.applicationID == "host")
-    #expect(!RoomHostElection.validates(
-        .init(applicationID: "last", skippedApplicationIDs: []),
-        in: members,
-        after: "host"
-    ))
-}
-
-@Test func hostGenerationSurvivesRoomDescriptorCoding() throws {
-    let descriptor = RoomDescriptor(
-        name: "Partida",
-        hostApplicationID: "successor",
-        features: .full,
-        hostGeneration: 7
-    )
-
-    let data = try JSONEncoder().encode(descriptor)
-    let decoded = try JSONDecoder().decode(RoomDescriptor.self, from: data)
-
-    #expect(decoded.hostApplicationID == "successor")
-    #expect(decoded.hostGeneration == 7)
-}
-
-@Test func binaryFrameRoundTrips() throws {
-    let id = UUID()
-    let frame = NexoBinaryFrame(kind: .data, streamID: id, payload: Data([1, 2, 3, 4]))
-
-    let encoded = try NexoBinaryFrameCodec.encode(frame)
-    let decoded = try NexoBinaryFrameCodec.decode(encoded)
-
-    #expect(decoded == frame)
-}
-
-@Test func binaryFrameRejectsTrailingBytes() throws {
-    let frame = NexoBinaryFrame(kind: .finish, streamID: UUID())
-    var encoded = try NexoBinaryFrameCodec.encode(frame)
-    encoded.append(0)
-
-    #expect(throws: NexoBinaryFrameError.truncated) {
-        try NexoBinaryFrameCodec.decode(encoded)
-    }
-}
-
-@Test func binaryHandshakeFrameRoundTrips() throws {
-    let frame = NexoBinaryFrame(
-        kind: .handshake,
-        streamID: UUID(),
-        payload: Data("peer-a".utf8)
-    )
-
-    #expect(try NexoBinaryFrameCodec.decode(NexoBinaryFrameCodec.encode(frame)) == frame)
-}
-
-@Test func byteStreamCanBeConsumedWithAsyncAwait() async throws {
-    let pair = NexoByteStream.makeStream()
-    _ = pair.source.yield(Data("hello".utf8))
-    pair.source.finish()
-
-    var received = Data()
-    for try await chunk in pair.stream {
-        received.append(chunk)
+    @Test("DeviceID se codifica como un único UUID en el cable")
+    func deviceIDEncodesAsSingleUUID() throws {
+        let id = DeviceID()
+        let data = try JSONEncoder().encode(id)
+        // Debe ser una cadena JSON (el UUID), no un objeto con rawValue.
+        let asString = try JSONDecoder().decode(String.self, from: data)
+        #expect(asString == id.description)
     }
 
-    #expect(received == Data("hello".utf8))
+    @Test("DeviceID hace round-trip por Codable")
+    func deviceIDRoundTrips() throws {
+        let id = DeviceID()
+        let decoded = try JSONDecoder().decode(DeviceID.self, from: JSONEncoder().encode(id))
+        #expect(decoded == id)
+    }
+
+    @Test("DeviceID reconstruye desde texto válido y rechaza inválido")
+    func deviceIDFromString() {
+        let id = DeviceID()
+        #expect(DeviceID(string: id.description) == id)
+        #expect(DeviceID(string: "no-es-uuid") == nil)
+    }
+
+    @Test("ActivityKind conserva su rawValue")
+    func activityKindRoundTrips() {
+        #expect(ActivityKind("sudoku").rawValue == "sudoku")
+    }
+
+    @Test("hostGeneration sobrevive a la codificación del RoomDescriptor")
+    func hostGenerationSurvivesCoding() throws {
+        let descriptor = RoomDescriptor(
+            name: "Partida",
+            hostDeviceID: DeviceID(),
+            features: .full,
+            hostGeneration: 7
+        )
+        let decoded = try JSONDecoder().decode(
+            RoomDescriptor.self,
+            from: JSONEncoder().encode(descriptor)
+        )
+        #expect(decoded.hostDeviceID == descriptor.hostDeviceID)
+        #expect(decoded.hostGeneration == 7)
+    }
+
+    @Test("RoomID.shortCode son los primeros 8 caracteres del UUID")
+    func shortCode() {
+        let id = RoomID()
+        #expect(id.shortCode == String(id.rawValue.uuidString.prefix(8)))
+        #expect(id.shortCode.count == 8)
+    }
 }

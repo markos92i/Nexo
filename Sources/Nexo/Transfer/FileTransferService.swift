@@ -10,29 +10,32 @@ import Foundation
 
 /// Room-scoped TCP transfers. Only protocol state lives on the shared actor;
 /// each transfer has a separate disk actor owning its handles and checksum.
+///
+/// Las transferencias viajan por el canal principal (TCP/PSK) vía
+/// `outbox.send(FileTransferMessage..., channel: .fileTransfer, ...)`. No usan QUIC.
 @NexoActor
-public final class FileTransferService {
+public final class FileTransferService: RoomTransferHandling {
     @NexoActor
     private final class Upload {
         let id: UUID
         let roomID: RoomID
         let file: TransferFile
-        let originalRecipients: Set<String>
-        var recipients: Set<String>
-        var acceptedRecipients: Set<String> = []
-        var completedRecipients: Set<String> = []
-        var rejectedRecipients: [String: NexoReason] = [:]
-        var acknowledgedIndexes: [String: Int] = [:]
+        let originalRecipients: Set<DeviceID>
+        var recipients: Set<DeviceID>
+        var acceptedRecipients: Set<DeviceID> = []
+        var completedRecipients: Set<DeviceID> = []
+        var rejectedRecipients: [DeviceID: DisconnectReason] = [:]
+        var acknowledgedIndexes: [DeviceID: Int] = [:]
         var offer: FileOffer?
         var nextChunkIndex = 0
         var preparation: Task<PreparedTransferFile, Error>?
         var pumpTask: Task<Void, Never>?
-        weak var session: RoomSession?
+        weak var room: Room?
 
-        init(id: UUID, session: RoomSession, file: TransferFile, recipients: Set<String>) {
+        init(id: UUID, room: Room, file: TransferFile, recipients: Set<DeviceID>) {
             self.id = id
-            self.roomID = session.roomID
-            self.session = session
+            self.roomID = room.roomID
+            self.room = room
             self.file = file
             self.originalRecipients = recipients
             self.recipients = recipients
@@ -46,20 +49,20 @@ public final class FileTransferService {
     @NexoActor
     private final class Download {
         let offer: FileOffer
-        let sender: String
+        let sender: DeviceID
         let file: TransferFile
         var isPrepared = false
         var nextReceivedIndex = 0
         var nextWrittenIndex = 0
         var pendingChunks: [FileChunk] = []
         var task: Task<Void, Never>?
-        weak var session: RoomSession?
+        weak var room: Room?
 
-        init(offer: FileOffer, sender: String, file: TransferFile, session: RoomSession) {
+        init(offer: FileOffer, sender: DeviceID, file: TransferFile, room: Room) {
             self.offer = offer
             self.sender = sender
             self.file = file
-            self.session = session
+            self.room = room
         }
     }
 
@@ -76,7 +79,7 @@ public final class FileTransferService {
 
     public private(set) var states: [UUID: FileTransferState] = [:]
     public private(set) var receivedFiles: [UUID: URL] = [:]
-    public private(set) var recipientOutcomes: [UUID: [String: FileTransferRecipientOutcome]] = [:]
+    public private(set) var recipientOutcomes: [UUID: [DeviceID: FileTransferRecipientOutcome]] = [:]
 
     private let storageID = UUID()
     private var uploads: [UUID: Upload] = [:]
@@ -110,7 +113,7 @@ public final class FileTransferService {
         for upload in uploads.values {
             upload.preparation?.cancel()
             upload.pumpTask?.cancel()
-            upload.session?.outbox.send(
+            upload.room?.outbox.send(
                 FileTransferMessage.cancel(FileTransferRejection(transferID: upload.id, roomID: upload.roomID, reason: .senderCancelled)),
                 channel: .fileTransfer, to: Array(upload.recipients.subtracting(upload.completedRecipients))
             )
@@ -118,7 +121,7 @@ public final class FileTransferService {
         }
         for download in downloads.values {
             download.task?.cancel()
-            download.session?.outbox.send(
+            download.room?.outbox.send(
                 FileTransferMessage.cancel(FileTransferRejection(transferID: download.offer.transferID, roomID: download.offer.roomID, reason: .receiverCancelled)),
                 channel: .fileTransfer, to: [download.sender]
             )
@@ -157,15 +160,15 @@ public final class FileTransferService {
         fileURL: URL,
         fileName: String? = nil,
         mimeType: String,
-        in session: RoomSession,
+        in room: Room,
         isTemporarySource: Bool = false
     ) async throws -> ChatAttachment {
         try await prepareOffer(
             source: .file(fileURL),
             fileName: fileName ?? fileURL.lastPathComponent,
             mimeType: mimeType,
-            reservedBytes: P2PLimits.maximumTransferBytes,
-            in: session
+            reservedBytes: Limits.maximumTransferBytes,
+            in: room
         )
     }
 
@@ -174,14 +177,14 @@ public final class FileTransferService {
         data: Data,
         fileName: String,
         mimeType: String,
-        in session: RoomSession
+        in room: Room
     ) async throws -> ChatAttachment {
-        guard !data.isEmpty, data.count <= P2PLimits.maximumTransferBytes else {
+        guard !data.isEmpty, data.count <= Limits.maximumTransferBytes else {
             throw FileTransferError.tooLarge(Int64(data.count))
         }
         return try await prepareOffer(
             source: .data(data), fileName: fileName, mimeType: mimeType,
-            reservedBytes: Int64(data.count), in: session
+            reservedBytes: Int64(data.count), in: room
         )
     }
 
@@ -190,23 +193,23 @@ public final class FileTransferService {
         fileName: String,
         mimeType: String,
         reservedBytes: Int64,
-        in session: RoomSession
+        in room: Room
     ) async throws -> ChatAttachment {
         try Task.checkCancellation()
-        guard session.features.hasFileTransfer else { throw RoomError.featureUnavailable(.fileTransfer) }
-        guard session.accessState == .joined else { throw FileTransferError.cancelled }
+        guard room.features.hasFileTransfer else { throw RoomError.featureUnavailable(.fileTransfer) }
+        guard room.accessState == .joined else { throw FileTransferError.cancelled }
         guard !fileName.isEmpty, fileName.utf8.count <= 255, mimeType.utf8.count <= 255 else {
             throw FileTransferError.unsupportedType(mimeType)
         }
         prune()
         let id = UUID()
-        let recipients = Set(session.remoteMembers.map(\.applicationID))
+        let recipients = Set(room.remoteMembers.map(\.deviceID))
         let file = TransferFile(storageID: storageID)
         try TransferBudget.reserve(file.token, bytes: reservedBytes, peers: recipients)
-        let upload = Upload(id: id, session: session, file: file, recipients: recipients)
+        let upload = Upload(id: id, room: room, file: file, recipients: recipients)
         uploads[id] = upload
         recipientOutcomes[id] = recipients.reduce(into: [:]) { $0[$1] = .pending }
-        armDeadline(id, in: session)
+        armDeadline(id, in: room)
         let preparation = Task { try await file.prepareUpload(source: source, fileName: fileName) }
         upload.preparation = preparation
         do {
@@ -216,18 +219,18 @@ public final class FileTransferService {
                 preparation.cancel()
             }
             try Task.checkCancellation()
-            guard uploads[id] === upload, session.accessState == .joined else {
+            guard uploads[id] === upload, room.accessState == .joined else {
                 throw FileTransferError.cancelled
             }
             upload.preparation = nil
             // Membership can change during the copy; never resurrect a removed peer.
-            let departed = upload.recipients.filter { !session.contains($0) }
-            removeRecipients(Set(departed), from: upload, reason: .peerDisconnected, in: session)
+            let departed = upload.recipients.filter { !room.contains($0) }
+            removeRecipients(Set(departed), from: upload, reason: .peerDisconnected, in: room)
             guard uploads[id] === upload else { throw FileTransferError.cancelled }
             TransferBudget.resize(file.token, bytes: prepared.size)
-            let chunkSize = P2PLimits.transferChunkBytes
+            let chunkSize = Limits.transferChunkBytes
             let offer = FileOffer(
-                transferID: id, messageID: nil, roomID: session.roomID,
+                transferID: id, messageID: nil, roomID: room.roomID,
                 fileName: fileName, mimeType: mimeType, fileSize: prepared.size,
                 checksum: prepared.checksum,
                 chunkCount: Int((prepared.size + Int64(chunkSize) - 1) / Int64(chunkSize)),
@@ -235,12 +238,12 @@ public final class FileTransferService {
             )
             upload.offer = offer
             localFiles[id] = LocalFile(url: prepared.url, file: file, size: prepared.size)
-            update(id, state: .offered, in: session)
+            update(id, state: .offered, in: room)
             if upload.originalRecipients.isEmpty {
-                finishUpload(upload, in: session)
+                finishUpload(upload, in: room)
             } else {
-                session.outbox.send(FileTransferMessage.offer(offer), channel: .fileTransfer, to: Array(upload.recipients))
-                armDeadline(id, in: session)
+                room.outbox.send(FileTransferMessage.offer(offer), channel: .fileTransfer, to: Array(upload.recipients))
+                armDeadline(id, in: room)
             }
             return ChatAttachment(
                 transferID: id, fileName: fileName, mimeType: mimeType,
@@ -249,92 +252,92 @@ public final class FileTransferService {
         } catch {
             if uploads[id] === upload {
                 if Task.isCancelled || error is CancellationError || (error as? FileTransferError) == .cancelled {
-                    terminate(id, state: .cancelled, reason: .senderCancelled, in: session)
+                    terminate(id, state: .cancelled, reason: .senderCancelled, in: room)
                 } else {
-                    abort(id, reason: Self.reason(for: error), in: session)
+                    abort(id, reason: Self.reason(for: error), in: room)
                 }
             }
             throw error
         }
     }
 
-    public func cancel(_ transferID: UUID, in session: RoomSession) {
-        let reason: NexoReason = uploads[transferID] == nil ? .receiverCancelled : .senderCancelled
-        terminate(transferID, state: .cancelled, reason: reason, in: session)
+    public func cancel(_ transferID: UUID, in room: Room) {
+        let reason: DisconnectReason = uploads[transferID] == nil ? .receiverCancelled : .senderCancelled
+        terminate(transferID, state: .cancelled, reason: reason, in: room)
     }
 
-    func cancelAll(in session: RoomSession) {
-        let ids = uploads.values.filter { $0.roomID == session.roomID }.map(\.id)
-            + downloads.values.filter { $0.offer.roomID == session.roomID }.map { $0.offer.transferID }
-        for id in ids { cancel(id, in: session) }
+    public func cancelAll(in room: Room) {
+        let ids = uploads.values.filter { $0.roomID == room.roomID }.map(\.id)
+            + downloads.values.filter { $0.offer.roomID == room.roomID }.map { $0.offer.transferID }
+        for id in ids { cancel(id, in: room) }
     }
 
-    func reconcileMembers(in session: RoomSession) {
-        for upload in Array(uploads.values) where upload.roomID == session.roomID {
+    public func reconcileMembers(in room: Room) {
+        for upload in Array(uploads.values) where upload.roomID == room.roomID {
             removeRecipients(
-                Set(upload.recipients.filter { !session.contains($0) }),
-                from: upload, reason: .peerDisconnected, in: session
+                Set(upload.recipients.filter { !room.contains($0) }),
+                from: upload, reason: .peerDisconnected, in: room
             )
         }
         for download in Array(downloads.values)
-        where download.offer.roomID == session.roomID && !session.contains(download.sender) {
-            abort(download.offer.transferID, reason: .peerDisconnected, in: session)
+        where download.offer.roomID == room.roomID && !room.contains(download.sender) {
+            abort(download.offer.transferID, reason: .peerDisconnected, in: room)
         }
     }
 
     // MARK: - Receiving
 
-    public func handle(envelope: RoomEnvelope, from member: RoomMember, in session: RoomSession) {
-        guard envelope.roomID == session.roomID, envelope.channel == .fileTransfer,
-              envelope.senderApplicationID == member.applicationID,
-              session.accessState == .joined, session.features.hasFileTransfer,
-              session.contains(member.applicationID),
+    public func handle(envelope: Envelope, from member: RoomMember, in room: Room) {
+        guard envelope.roomID == room.roomID, envelope.channel == .fileTransfer,
+              envelope.senderDeviceID == member.deviceID,
+              room.accessState == .joined, room.features.hasFileTransfer,
+              room.contains(member.deviceID),
               let message = try? envelope.decodePayload(as: FileTransferMessage.self) else { return }
         switch message {
         case .offer(let offer):
-            accept(offer: offer, from: member, in: session)
+            accept(offer: offer, from: member, in: room)
         case .accept(let control):
-            guard control.roomID == session.roomID, let upload = uploads[control.transferID],
-                  upload.roomID == session.roomID, upload.offer != nil,
-                  upload.recipients.contains(member.applicationID),
-                  upload.acceptedRecipients.insert(member.applicationID).inserted else { return }
-            armDeadline(control.transferID, in: session)
-            startPumping(control.transferID, in: session)
+            guard control.roomID == room.roomID, let upload = uploads[control.transferID],
+                  upload.roomID == room.roomID, upload.offer != nil,
+                  upload.recipients.contains(member.deviceID),
+                  upload.acceptedRecipients.insert(member.deviceID).inserted else { return }
+            armDeadline(control.transferID, in: room)
+            startPumping(control.transferID, in: room)
         case .reject(let rejection), .cancel(let rejection):
-            guard rejection.roomID == session.roomID else { return }
-            if let upload = uploads[rejection.transferID], upload.roomID == session.roomID,
-               upload.recipients.contains(member.applicationID) {
-                removeRecipients([member.applicationID], from: upload, reason: rejection.reason, in: session)
+            guard rejection.roomID == room.roomID else { return }
+            if let upload = uploads[rejection.transferID], upload.roomID == room.roomID,
+               upload.recipients.contains(member.deviceID) {
+                removeRecipients([member.deviceID], from: upload, reason: rejection.reason, in: room)
             } else if let download = downloads[rejection.transferID],
-                      download.offer.roomID == session.roomID, download.sender == member.applicationID {
-                terminate(rejection.transferID, state: .failed(rejection.reason), reason: rejection.reason, in: session, notify: false)
+                      download.offer.roomID == room.roomID, download.sender == member.deviceID {
+                terminate(rejection.transferID, state: .failed(rejection.reason), reason: rejection.reason, in: room, notify: false)
             }
         case .acknowledge(let ack):
-            guard ack.roomID == session.roomID, let upload = uploads[ack.transferID],
-                  upload.roomID == session.roomID, upload.acceptedRecipients.contains(member.applicationID),
-                  upload.recipients.contains(member.applicationID),
-                  ack.receivedThroughIndex > (upload.acknowledgedIndexes[member.applicationID] ?? -1),
+            guard ack.roomID == room.roomID, let upload = uploads[ack.transferID],
+                  upload.roomID == room.roomID, upload.acceptedRecipients.contains(member.deviceID),
+                  upload.recipients.contains(member.deviceID),
+                  ack.receivedThroughIndex > (upload.acknowledgedIndexes[member.deviceID] ?? -1),
                   ack.receivedThroughIndex < upload.nextChunkIndex else { return }
-            upload.acknowledgedIndexes[member.applicationID] = ack.receivedThroughIndex
-            armDeadline(ack.transferID, in: session)
-            reportUploadProgress(upload, in: session)
-            startPumping(ack.transferID, in: session)
+            upload.acknowledgedIndexes[member.deviceID] = ack.receivedThroughIndex
+            armDeadline(ack.transferID, in: room)
+            reportUploadProgress(upload, in: room)
+            startPumping(ack.transferID, in: room)
         case .chunk(let chunk):
-            receive(chunk: chunk, from: member, in: session)
+            receive(chunk: chunk, from: member, in: room)
         case .completed(let control):
-            guard control.roomID == session.roomID, let upload = uploads[control.transferID],
-                  upload.roomID == session.roomID, let offer = upload.offer,
+            guard control.roomID == room.roomID, let upload = uploads[control.transferID],
+                  upload.roomID == room.roomID, let offer = upload.offer,
                   upload.nextChunkIndex == offer.chunkCount,
-                  upload.acceptedRecipients.contains(member.applicationID),
-                  upload.recipients.contains(member.applicationID),
-                  upload.completedRecipients.insert(member.applicationID).inserted else { return }
-            upload.acknowledgedIndexes[member.applicationID] = offer.chunkCount - 1
-            recipientOutcomes[control.transferID]?[member.applicationID] = .completed
-            armDeadline(control.transferID, in: session)
+                  upload.acceptedRecipients.contains(member.deviceID),
+                  upload.recipients.contains(member.deviceID),
+                  upload.completedRecipients.insert(member.deviceID).inserted else { return }
+            upload.acknowledgedIndexes[member.deviceID] = offer.chunkCount - 1
+            recipientOutcomes[control.transferID]?[member.deviceID] = .completed
+            armDeadline(control.transferID, in: room)
             if upload.completedRecipients.isSuperset(of: upload.recipients) {
-                finishUpload(upload, in: session)
+                finishUpload(upload, in: room)
             } else {
-                startPumping(control.transferID, in: session)
+                startPumping(control.transferID, in: room)
             }
         }
     }
@@ -367,7 +370,7 @@ public final class FileTransferService {
             localFiles.removeValue(forKey: id)
             receivedFiles.removeValue(forKey: id)
             if let upload = uploads[id] {
-                if let session = upload.session { abort(id, reason: .fileReadFailed, in: session) }
+                if let room = upload.room { abort(id, reason: .fileReadFailed, in: room) }
                 else { discardOrphanedTransfer(id) }
             } else {
                 dispose(local.file)
@@ -393,43 +396,43 @@ public final class FileTransferService {
 
     // MARK: - Sending by chunks
 
-    private func startPumping(_ id: UUID, in session: RoomSession) {
+    private func startPumping(_ id: UUID, in room: Room) {
         guard let upload = uploads[id], let offer = upload.offer,
-              upload.roomID == session.roomID, upload.pumpTask == nil,
+              upload.roomID == room.roomID, upload.pumpTask == nil,
               !upload.recipients.isEmpty,
               upload.acceptedRecipients.isSuperset(of: upload.recipients) else { return }
-        upload.pumpTask = Task { @NexoActor [weak self, weak session] in
+        upload.pumpTask = Task { @NexoActor [weak self, weak room] in
             defer { upload.pumpTask = nil }
             while !Task.isCancelled, upload.nextChunkIndex < offer.chunkCount {
-                guard upload.nextChunkIndex - upload.slowestAcknowledgedIndex - 1 < P2PLimits.transferWindowChunks else { return }
+                guard upload.nextChunkIndex - upload.slowestAcknowledgedIndex - 1 < Limits.transferWindowChunks else { return }
                 let index = upload.nextChunkIndex
                 let length = Int(min(Int64(offer.chunkSize), offer.fileSize - Int64(index) * Int64(offer.chunkSize)))
                 do {
                     let data = try await upload.file.read(index: index, chunkSize: offer.chunkSize, length: length)
                     guard !Task.isCancelled, let self, self.uploads[id] === upload else { return }
-                    guard let session = self.usableSession(session, for: id), !upload.recipients.isEmpty else { return }
+                    guard let room = self.usableRoom(room, for: id), !upload.recipients.isEmpty else { return }
                     // Publish the sent index before an ACK can refill this window.
                     upload.nextChunkIndex += 1
-                    session.outbox.send(
+                    room.outbox.send(
                         FileTransferMessage.chunk(FileChunk(transferID: id, index: index, data: data)),
                         channel: .fileTransfer, to: Array(upload.recipients.subtracting(upload.completedRecipients))
                     )
                 } catch {
                     guard let self, self.uploads[id] === upload, !Task.isCancelled,
-                          let session = self.usableSession(session, for: id) else { return }
-                    self.abort(id, reason: .fileReadFailed, in: session)
+                          let room = self.usableRoom(room, for: id) else { return }
+                    self.abort(id, reason: .fileReadFailed, in: room)
                     return
                 }
             }
         }
     }
 
-    private func reportUploadProgress(_ upload: Upload, in session: RoomSession) {
+    private func reportUploadProgress(_ upload: Upload, in room: Room) {
         guard let offer = upload.offer else { return }
-        update(upload.id, state: .transferring(progress: Double(upload.slowestAcknowledgedIndex + 1) / Double(offer.chunkCount)), in: session)
+        update(upload.id, state: .transferring(progress: Double(upload.slowestAcknowledgedIndex + 1) / Double(offer.chunkCount)), in: room)
     }
 
-    private func removeRecipients(_ ids: Set<String>, from upload: Upload, reason: NexoReason, in session: RoomSession) {
+    private func removeRecipients(_ ids: Set<DeviceID>, from upload: Upload, reason: DisconnectReason, in room: Room) {
         guard !ids.isEmpty, uploads[upload.id] === upload else { return }
         for id in ids where upload.recipients.contains(id) && !upload.completedRecipients.contains(id) {
             upload.recipients.remove(id)
@@ -439,18 +442,18 @@ public final class FileTransferService {
             recipientOutcomes[upload.id]?[id] = .rejected(reason)
         }
         if upload.recipients.isEmpty {
-            abort(upload.id, reason: reason, in: session)
+            abort(upload.id, reason: reason, in: room)
         } else if upload.offer != nil, upload.completedRecipients.isSuperset(of: upload.recipients) {
-            finishUpload(upload, in: session)
+            finishUpload(upload, in: room)
         } else {
-            startPumping(upload.id, in: session)
+            startPumping(upload.id, in: room)
         }
     }
 
-    private func finishUpload(_ upload: Upload, in session: RoomSession) {
+    private func finishUpload(_ upload: Upload, in room: Room) {
         guard uploads[upload.id] === upload else { return }
         guard let local = localFiles[upload.id] else {
-            abort(upload.id, reason: .fileReadFailed, in: session)
+            abort(upload.id, reason: .fileReadFailed, in: room)
             return
         }
         uploads.removeValue(forKey: upload.id)
@@ -459,136 +462,136 @@ public final class FileTransferService {
         TransferBudget.finish(upload.file.token)
         Task { await upload.file.close() }
         // Preserve per-peer outcomes, but never report a mixed result as success.
-        if let reason = upload.rejectedRecipients.sorted(by: { $0.key < $1.key }).first?.value {
-            update(upload.id, state: .failed(reason), in: session)
+        if let reason = upload.rejectedRecipients.sorted(by: { $0.key.description < $1.key.description }).first?.value {
+            update(upload.id, state: .failed(reason), in: room)
         } else {
-            update(upload.id, state: .completed(url: local.url), in: session)
+            update(upload.id, state: .completed(url: local.url), in: room)
         }
     }
 
     // MARK: - Receiving by chunks
 
-    private func accept(offer: FileOffer, from member: RoomMember, in session: RoomSession) {
-        guard offer.roomID == session.roomID, states[offer.transferID] == nil,
+    private func accept(offer: FileOffer, from member: RoomMember, in room: Room) {
+        guard offer.roomID == room.roomID, states[offer.transferID] == nil,
               terminalDates[offer.transferID] == nil, localFiles[offer.transferID] == nil,
               uploads[offer.transferID] == nil, downloads[offer.transferID] == nil else { return }
-        guard offer.fileSize > 0, offer.fileSize <= P2PLimits.maximumTransferBytes else {
-            reject(offer, reason: .fileTooLarge(offer.fileSize), in: session, to: member.applicationID)
+        guard offer.fileSize > 0, offer.fileSize <= Limits.maximumTransferBytes else {
+            reject(offer, reason: .fileTooLarge(offer.fileSize), in: room, to: member.deviceID)
             return
         }
         guard offer.chunkCount > 0, offer.chunkSize > 0,
-              offer.chunkSize <= P2PLimits.transferChunkBytes * 4,
+              offer.chunkSize <= Limits.transferChunkBytes * 4,
               Int64(offer.chunkCount) == (offer.fileSize + Int64(offer.chunkSize) - 1) / Int64(offer.chunkSize),
               !offer.fileName.isEmpty, offer.fileName.utf8.count <= 255, offer.mimeType.utf8.count <= 255,
               offer.checksum.utf8.count == 64,
               offer.checksum.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
-            reject(offer, reason: .invalidOffer, in: session, to: member.applicationID)
+            reject(offer, reason: .invalidOffer, in: room, to: member.deviceID)
             return
         }
         prune()
         let file = TransferFile(storageID: storageID)
         do {
-            try TransferBudget.reserve(file.token, bytes: offer.fileSize, peers: [member.applicationID])
+            try TransferBudget.reserve(file.token, bytes: offer.fileSize, peers: [member.deviceID])
         } catch {
-            reject(offer, reason: Self.reason(for: error), in: session, to: member.applicationID)
+            reject(offer, reason: Self.reason(for: error), in: room, to: member.deviceID)
             return
         }
         let id = offer.transferID
-        let download = Download(offer: offer, sender: member.applicationID, file: file, session: session)
+        let download = Download(offer: offer, sender: member.deviceID, file: file, room: room)
         downloads[id] = download
-        armDeadline(id, in: session)
-        download.task = Task { @NexoActor [weak self, weak session] in
+        armDeadline(id, in: room)
+        download.task = Task { @NexoActor [weak self, weak room] in
             do {
                 try await file.prepareDownload(fileName: offer.fileName)
                 guard !Task.isCancelled, let self, self.downloads[id] === download,
-                      let session = self.usableSession(session, for: id) else { return }
-                guard session.contains(download.sender) else {
-                    self.abort(id, reason: .peerDisconnected, in: session)
+                      let room = self.usableRoom(room, for: id) else { return }
+                guard room.contains(download.sender) else {
+                    self.abort(id, reason: .peerDisconnected, in: room)
                     return
                 }
                 download.isPrepared = true
                 download.task = nil
-                self.update(id, state: .accepted, in: session)
-                self.armDeadline(id, in: session)
-                session.outbox.send(
-                    FileTransferMessage.accept(FileTransferControl(transferID: id, roomID: session.roomID)),
+                self.update(id, state: .accepted, in: room)
+                self.armDeadline(id, in: room)
+                room.outbox.send(
+                    FileTransferMessage.accept(FileTransferControl(transferID: id, roomID: room.roomID)),
                     channel: .fileTransfer, to: [download.sender]
                 )
             } catch {
                 guard let self, self.downloads[id] === download, !Task.isCancelled,
-                      let session = self.usableSession(session, for: id) else { return }
-                self.abort(id, reason: .filePrepareFailed, in: session)
+                      let room = self.usableRoom(room, for: id) else { return }
+                self.abort(id, reason: .filePrepareFailed, in: room)
             }
         }
     }
 
-    private func reject(_ offer: FileOffer, reason: NexoReason, in session: RoomSession, to peer: String) {
+    private func reject(_ offer: FileOffer, reason: DisconnectReason, in room: Room, to peer: DeviceID) {
         // Retain only a bounded terminal status, never a file or inbox reservation.
-        update(offer.transferID, state: .failed(reason), in: session)
-        session.outbox.send(
-            FileTransferMessage.reject(FileTransferRejection(transferID: offer.transferID, roomID: session.roomID, reason: reason)),
+        update(offer.transferID, state: .failed(reason), in: room)
+        room.outbox.send(
+            FileTransferMessage.reject(FileTransferRejection(transferID: offer.transferID, roomID: room.roomID, reason: reason)),
             channel: .fileTransfer, to: [peer]
         )
     }
 
-    private func receive(chunk: FileChunk, from member: RoomMember, in session: RoomSession) {
-        guard let download = downloads[chunk.transferID], download.offer.roomID == session.roomID,
-              download.sender == member.applicationID else { return }
+    private func receive(chunk: FileChunk, from member: RoomMember, in room: Room) {
+        guard let download = downloads[chunk.transferID], download.offer.roomID == room.roomID,
+              download.sender == member.deviceID else { return }
         guard download.isPrepared, chunk.index == download.nextReceivedIndex,
               chunk.index < download.offer.chunkCount,
-              download.nextReceivedIndex - download.nextWrittenIndex < P2PLimits.transferWindowChunks else {
-            abort(chunk.transferID, reason: .invalidOffer, in: session)
+              download.nextReceivedIndex - download.nextWrittenIndex < Limits.transferWindowChunks else {
+            abort(chunk.transferID, reason: .invalidOffer, in: room)
             return
         }
         let remaining = download.offer.fileSize - Int64(chunk.index) * Int64(download.offer.chunkSize)
         guard chunk.data.count == Int(min(Int64(download.offer.chunkSize), remaining)) else {
-            abort(chunk.transferID, reason: .invalidOffer, in: session)
+            abort(chunk.transferID, reason: .invalidOffer, in: room)
             return
         }
         download.pendingChunks.append(chunk)
         download.nextReceivedIndex += 1
-        drain(download, in: session)
+        drain(download, in: room)
     }
 
-    private func drain(_ download: Download, in session: RoomSession) {
+    private func drain(_ download: Download, in room: Room) {
         guard download.task == nil else { return }
         let id = download.offer.transferID
-        download.task = Task { @NexoActor [weak self, weak session] in
+        download.task = Task { @NexoActor [weak self, weak room] in
             defer { download.task = nil }
             while !Task.isCancelled, !download.pendingChunks.isEmpty {
                 let chunk = download.pendingChunks.removeFirst()
                 do {
                     let finalURL = try await download.file.write(chunk, offer: download.offer)
                     guard !Task.isCancelled, let self, self.downloads[id] === download,
-                          let session = self.usableSession(session, for: id) else { return }
+                          let room = self.usableRoom(room, for: id) else { return }
                     download.nextWrittenIndex += 1
-                    self.armDeadline(id, in: session)
+                    self.armDeadline(id, in: room)
                     if let finalURL {
                         self.downloads.removeValue(forKey: id)
                         self.localFiles[id] = LocalFile(url: finalURL, file: download.file, size: download.offer.fileSize)
                         self.receivedFiles[id] = finalURL
                         TransferBudget.finish(download.file.token)
-                        self.update(id, state: .completed(url: finalURL), in: session)
+                        self.update(id, state: .completed(url: finalURL), in: room)
                         // No final ACK or completion can precede checksum and rename.
-                        session.outbox.send(
-                            FileTransferMessage.completed(FileTransferControl(transferID: id, roomID: session.roomID)),
+                        room.outbox.send(
+                            FileTransferMessage.completed(FileTransferControl(transferID: id, roomID: room.roomID)),
                             channel: .fileTransfer, to: [download.sender]
                         )
                         return
                     }
-                    self.update(id, state: .transferring(progress: Double(download.nextWrittenIndex) / Double(download.offer.chunkCount)), in: session)
-                    if download.nextWrittenIndex % max(1, P2PLimits.transferWindowChunks / 2) == 0 {
-                        session.outbox.send(
+                    self.update(id, state: .transferring(progress: Double(download.nextWrittenIndex) / Double(download.offer.chunkCount)), in: room)
+                    if download.nextWrittenIndex % max(1, Limits.transferWindowChunks / 2) == 0 {
+                        room.outbox.send(
                             FileTransferMessage.acknowledge(FileTransferAcknowledgement(
-                                transferID: id, roomID: session.roomID,
+                                transferID: id, roomID: room.roomID,
                                 receivedThroughIndex: download.nextWrittenIndex - 1
                             )), channel: .fileTransfer, to: [download.sender]
                         )
                     }
                 } catch {
                     guard let self, self.downloads[id] === download, !Task.isCancelled,
-                          let session = self.usableSession(session, for: id) else { return }
-                    self.abort(id, reason: Self.reason(for: error), in: session)
+                          let room = self.usableRoom(room, for: id) else { return }
+                    self.abort(id, reason: Self.reason(for: error), in: room)
                     return
                 }
             }
@@ -597,33 +600,33 @@ public final class FileTransferService {
 
     // MARK: - Lifetime and progress
 
-    private func usableSession(_ session: RoomSession?, for id: UUID) -> RoomSession? {
-        guard let session else {
+    private func usableRoom(_ room: Room?, for id: UUID) -> Room? {
+        guard let room else {
             discardOrphanedTransfer(id)
             return nil
         }
-        guard session.accessState == .joined else {
-            abort(id, reason: .sessionEnded, in: session)
+        guard room.accessState == .joined else {
+            abort(id, reason: .sessionEnded, in: room)
             return nil
         }
-        return session
+        return room
     }
 
-    private func abort(_ id: UUID, reason: NexoReason, in session: RoomSession) {
-        terminate(id, state: .failed(reason), reason: reason, in: session)
+    private func abort(_ id: UUID, reason: DisconnectReason, in room: Room) {
+        terminate(id, state: .failed(reason), reason: reason, in: room)
     }
 
-    private func terminate(_ id: UUID, state: FileTransferState, reason: NexoReason, in session: RoomSession, notify: Bool = true) {
+    private func terminate(_ id: UUID, state: FileTransferState, reason: DisconnectReason, in room: Room, notify: Bool = true) {
         let file: TransferFile
-        let peers: [String]
-        if let upload = uploads[id], upload.roomID == session.roomID {
+        let peers: [DeviceID]
+        if let upload = uploads[id], upload.roomID == room.roomID {
             uploads.removeValue(forKey: id)
             upload.preparation?.cancel()
             upload.pumpTask?.cancel()
             peers = Array(upload.recipients.subtracting(upload.completedRecipients))
             for peer in peers { recipientOutcomes[id]?[peer] = .rejected(reason) }
             file = upload.file
-        } else if let download = downloads[id], download.offer.roomID == session.roomID {
+        } else if let download = downloads[id], download.offer.roomID == room.roomID {
             downloads.removeValue(forKey: id)
             download.task?.cancel()
             download.pendingChunks.removeAll()
@@ -631,8 +634,8 @@ public final class FileTransferService {
             file = download.file
         } else { return }
         if notify, !peers.isEmpty {
-            session.outbox.send(
-                FileTransferMessage.cancel(FileTransferRejection(transferID: id, roomID: session.roomID, reason: reason)),
+            room.outbox.send(
+                FileTransferMessage.cancel(FileTransferRejection(transferID: id, roomID: room.roomID, reason: reason)),
                 channel: .fileTransfer, to: peers
             )
         }
@@ -642,21 +645,21 @@ public final class FileTransferService {
         } else {
             dispose(file)
         }
-        update(id, state: state, in: session)
+        update(id, state: state, in: room)
     }
 
-    private func armDeadline(_ id: UUID, in session: RoomSession) {
+    private func armDeadline(_ id: UUID, in room: Room) {
         deadlines.removeValue(forKey: id)?.task.cancel()
         let token = UUID()
-        let task = Task { @NexoActor [weak self, weak session] in
+        let task = Task { @NexoActor [weak self, weak room] in
             do { try await Task.sleep(for: FileTransferLimits.inactivityTimeout) }
             catch { return }
             guard !Task.isCancelled, let self, self.deadlines[id]?.token == token else { return }
-            guard let session else {
+            guard let room else {
                 self.discardOrphanedTransfer(id)
                 return
             }
-            self.abort(id, reason: Self.reason(for: FileTransferError.timedOut), in: session)
+            self.abort(id, reason: Self.reason(for: FileTransferError.timedOut), in: room)
         }
         deadlines[id] = Deadline(token: token, task: task)
     }
@@ -681,7 +684,7 @@ public final class FileTransferService {
         prune()
     }
 
-    private func update(_ id: UUID, state: FileTransferState, in session: RoomSession) {
+    private func update(_ id: UUID, state: FileTransferState, in room: Room) {
         if case .transferring(let progress) = state {
             guard states[id]?.isTerminal != true else { return }
             let now = ContinuousClock.now
@@ -689,13 +692,13 @@ public final class FileTransferService {
                 pendingProgress[id] = progress
                 if progressTasks[id] == nil {
                     let deadline = last.advanced(by: .milliseconds(100))
-                    progressTasks[id] = Task { @NexoActor [weak self, weak session] in
+                    progressTasks[id] = Task { @NexoActor [weak self, weak room] in
                         do { try await ContinuousClock().sleep(until: deadline) }
                         catch { return }
-                        guard !Task.isCancelled, let self, let session else { return }
+                        guard !Task.isCancelled, let self, let room else { return }
                         self.progressTasks.removeValue(forKey: id)
                         guard let value = self.pendingProgress.removeValue(forKey: id), self.states[id]?.isTerminal != true else { return }
-                        self.update(id, state: .transferring(progress: value), in: session)
+                        self.update(id, state: .transferring(progress: value), in: room)
                     }
                 }
                 return
@@ -710,7 +713,7 @@ public final class FileTransferService {
             lastProgress.removeValue(forKey: id)
             terminalDates[id] = .now
         }
-        session.chat?.updateTransfer(id, state: state)
+        room.chat?.updateTransfer(id, state: state)
         if state.isTerminal { prune() }
     }
 
@@ -761,7 +764,7 @@ public final class FileTransferService {
         }
     }
 
-    private static func reason(for error: any Error) -> NexoReason {
+    private static func reason(for error: any Error) -> DisconnectReason {
         switch error as? FileTransferError {
         case .checksumMismatch: .checksumMismatch
         case .tooLarge(let bytes): .fileTooLarge(bytes)
@@ -769,8 +772,9 @@ public final class FileTransferService {
         case .writeFailed(let reason): reason
         case .resourceLimit: .system(domain: "Nexo.FileTransfer", code: 1)
         case .timedOut: .system(domain: "Nexo.FileTransfer", code: 2)
-        case .incomplete, .bufferOverflow, .unsupportedType: .invalidOffer
-        case nil: NexoReason(error: error)
+        case .incomplete, .bufferOverflow, .unsupportedType, .invalidOffer: .invalidOffer
+        case .featureUnavailable, .binaryStreamsUnsupported: .invalidOffer
+        case nil: DisconnectReason(error: error)
         }
     }
 }
@@ -781,12 +785,12 @@ public final class FileTransferService {
 private enum TransferBudget {
     private struct Reservation {
         var bytes: Int64
-        let peers: Set<String>
+        let peers: Set<DeviceID>
         var isActive = true
     }
     private static var reservations: [UUID: Reservation] = [:]
 
-    static func reserve(_ token: UUID, bytes: Int64, peers: Set<String>) throws(FileTransferError) {
+    static func reserve(_ token: UUID, bytes: Int64, peers: Set<DeviceID>) throws(FileTransferError) {
         let active = reservations.values.filter(\.isActive)
         guard active.count < FileTransferLimits.maximumOpenTransfers,
               reservations.count < FileTransferLimits.maximumStoredTransfers,
@@ -866,7 +870,7 @@ private actor TransferFile {
             let values = try sourceURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
             guard values.isRegularFile == true else { throw FileTransferError.incomplete }
             let size = Int64(values.fileSize ?? 0)
-            guard size > 0, size <= P2PLimits.maximumTransferBytes else { throw FileTransferError.tooLarge(size) }
+            guard size > 0, size <= Limits.maximumTransferBytes else { throw FileTransferError.tooLarge(size) }
             guard FileManager.default.createFile(atPath: url.path, contents: nil) else { throw FileTransferError.writeFailed(.localCopyFailed) }
             let input = try FileHandle(forReadingFrom: sourceURL)
             defer { try? input.close() }
@@ -875,9 +879,9 @@ private actor TransferFile {
             var copied: Int64 = 0
             while true {
                 try Task.checkCancellation()
-                guard let block = try input.read(upToCount: P2PLimits.transferChunkBytes), !block.isEmpty else { break }
+                guard let block = try input.read(upToCount: Limits.transferChunkBytes), !block.isEmpty else { break }
                 copied += Int64(block.count)
-                guard copied <= P2PLimits.maximumTransferBytes else { throw FileTransferError.tooLarge(copied) }
+                guard copied <= Limits.maximumTransferBytes else { throw FileTransferError.tooLarge(copied) }
                 try output.write(contentsOf: block)
             }
             try output.close()
@@ -892,11 +896,11 @@ private actor TransferFile {
         var size: Int64 = 0
         while true {
             try Task.checkCancellation()
-            guard let block = try input.read(upToCount: P2PLimits.transferChunkBytes), !block.isEmpty else { break }
+            guard let block = try input.read(upToCount: Limits.transferChunkBytes), !block.isEmpty else { break }
             size += Int64(block.count)
             digest.update(data: block)
         }
-        guard size > 0, size <= P2PLimits.maximumTransferBytes else { throw FileTransferError.tooLarge(size) }
+        guard size > 0, size <= Limits.maximumTransferBytes else { throw FileTransferError.tooLarge(size) }
         return PreparedTransferFile(url: url, size: size, checksum: Self.hex(digest.finalize()))
     }
 

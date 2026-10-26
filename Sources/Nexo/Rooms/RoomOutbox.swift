@@ -1,46 +1,40 @@
-//
-//  RoomOutbox.swift
-//  Nexo
-//
-
 import Foundation
 
 // MARK: - RoomOutbox
 
-/// Room-scoped sender. The only way chat, activities and transfers send data.
+/// Emisor acotado a una sala. La única vía por la que chat, actividades y
+/// transferencias envían datos.
 ///
-/// Replaces singleton channels: every consumer gets a `RoomOutbox` bound to
-/// *its* room, so it can't write into another room and never needs to know
-/// about the transport.
+/// Sustituye a canales singleton: cada consumidor obtiene un `RoomOutbox` ligado
+/// a *su* sala, así que no puede escribir en otra y nunca necesita conocer el
+/// transporte.
 @NexoActor
 public final class RoomOutbox {
 
     public let roomID: RoomID
 
-    private let transport: any PeerTransport
-    private let identity: LocalP2PIdentity
-    private let isPeerAdmitted: @NexoActor @Sendable (String) -> Bool
+    private let transport: any Transport
+    private let identity: LocalIdentity
+    private let isPeerAdmitted: @NexoActor @Sendable (DeviceID) -> Bool
 
     private var sequence: UInt64 = 0
 
     private struct JournalEntry {
-        var envelope: RoomEnvelope
-        var recipients: Set<String>
+        var envelope: Envelope
+        var recipients: Set<DeviceID>
         var createdAt: Date
     }
 
-    /// Keeps recent messages for a short window so a peer can catch up after
-    /// a physical drop. The transport itself still knows nothing about rooms.
+    /// Mantiene mensajes recientes durante una ventana corta para que un peer se
+    /// ponga al día tras una caída física. El transporte sigue sin saber de salas.
     private var recoveryJournal: [JournalEntry] = []
     private var recoveryJournalBytes = 0
 
-    // MARK: - Init
-
     public init(
         roomID: RoomID,
-        transport: any PeerTransport,
-        identity: LocalP2PIdentity,
-        isPeerAdmitted: @escaping @NexoActor @Sendable (String) -> Bool
+        transport: any Transport,
+        identity: LocalIdentity,
+        isPeerAdmitted: @escaping @NexoActor @Sendable (DeviceID) -> Bool
     ) {
         self.roomID = roomID
         self.transport = transport
@@ -48,18 +42,18 @@ public final class RoomOutbox {
         self.isPeerAdmitted = isPeerAdmitted
     }
 
-    // MARK: - Public API
+    // MARK: - API pública
 
-    /// Sends a typed message on the given channel.
+    /// Envía un mensaje tipado por el canal indicado.
     ///
-    /// Encoding failures are ignored deliberately: a malformed message is a
-    /// programming error that shouldn't crash the UI, and the transport
-    /// already retries or reports disconnects on its own.
-    public func send<Message: Encodable & Sendable>(
-        _ message: Message,
-        channel: RoomChannel,
+    /// Los fallos de codificación se ignoran a propósito: un mensaje mal formado
+    /// es un error de programación que no debe tirar la UI, y el transporte ya
+    /// reintenta o reporta desconexiones por su cuenta.
+    public func send(
+        _ message: some Encodable & Sendable,
+        channel: Channel,
         activityID: ActivityID? = nil,
-        to recipients: [String],
+        to recipients: [DeviceID],
         delivery: DeliveryMode = .reliable,
         coalescingKey: String? = nil
     ) {
@@ -71,7 +65,7 @@ public final class RoomOutbox {
             coalescingKey: coalescingKey
         ) else { return }
 
-        let targets = recipients.filter { $0 != identity.applicationID }
+        let targets = recipients.filter { $0 != identity.deviceID }
         guard !targets.isEmpty else { return }
 
         appendToRecoveryJournal(envelope, recipients: targets)
@@ -80,26 +74,26 @@ public final class RoomOutbox {
         }
     }
 
-    /// Replays recent messages to a peer that just recovered its socket.
-    /// Message IDs are preserved so the receiver can idempotently drop duplicates.
-    public func replay(to applicationID: String) {
-        guard isPeerAdmitted(applicationID) else { return }
+    /// Reenvía mensajes recientes a un peer que acaba de recuperar su socket. Los
+    /// IDs de mensaje se preservan para que el receptor descarte duplicados.
+    public func replay(to deviceID: DeviceID) {
+        guard isPeerAdmitted(deviceID) else { return }
         pruneRecoveryJournal()
-        for entry in recoveryJournal where entry.recipients.contains(applicationID) {
-            transport.enqueue(entry.envelope, to: applicationID)
+        for entry in recoveryJournal where entry.recipients.contains(deviceID) {
+            transport.enqueue(entry.envelope, to: deviceID)
         }
     }
 
-    /// Sends bulky, replaceable state, like a board snapshot.
+    /// Envía estado voluminoso y reemplazable, como el snapshot de un tablero.
     ///
-    /// `coalescingKey` makes a pending snapshot get replaced by the next one
-    /// instead of piling up, so it never sits ahead of an authoritative order.
-    public func sendCoalesced<Message: Encodable & Sendable>(
-        _ message: Message,
-        channel: RoomChannel,
+    /// `coalescingKey` hace que un snapshot pendiente lo reemplace el siguiente en
+    /// vez de acumularse, para que nunca quede delante de una orden autoritativa.
+    public func sendCoalesced(
+        _ message: some Encodable & Sendable,
+        channel: Channel,
         activityID: ActivityID? = nil,
         coalescingKey: String,
-        to recipients: [String]
+        to recipients: [DeviceID]
     ) {
         send(
             message,
@@ -111,13 +105,13 @@ public final class RoomOutbox {
         )
     }
 
-    // MARK: - Recovery Journal
+    // MARK: - Journal de recuperación
 
-    private func appendToRecoveryJournal(_ envelope: RoomEnvelope, recipients: [String]) {
-        // Transfers have their own ACK protocol and must not reinject old
-        // chunks; chat and activities are resumable.
+    private func appendToRecoveryJournal(_ envelope: Envelope, recipients: [DeviceID]) {
+        // Las transferencias tienen su propio protocolo de ACK y no deben
+        // reinyectar chunks viejos; chat y actividades sí son reanudables.
         guard envelope.channel == .chat || envelope.channel == .activity else { return }
-        guard envelope.payload.count <= P2PLimits.maximumEnvelopeBytes else { return }
+        guard envelope.payload.count <= Limits.maximumEnvelopeBytes else { return }
 
         pruneRecoveryJournal()
         let recipientSet = Set(recipients)
@@ -143,7 +137,7 @@ public final class RoomOutbox {
     }
 
     private func pruneRecoveryJournal() {
-        let cutoff = Date().addingTimeInterval(-P2PLimits.recoveryJournalRetention)
+        let cutoff = Date().addingTimeInterval(-Limits.recoveryJournalRetention)
         var bytes = 0
         recoveryJournal.removeAll { entry in
             if entry.createdAt < cutoff { return true }
@@ -154,35 +148,35 @@ public final class RoomOutbox {
     }
 
     private func trimRecoveryJournalIfNeeded() {
-        while recoveryJournal.count > P2PLimits.recoveryJournalLimit
-                || recoveryJournalBytes > P2PLimits.recoveryJournalBytesLimit,
+        while recoveryJournal.count > Limits.recoveryJournalLimit
+                || recoveryJournalBytes > Limits.recoveryJournalBytesLimit,
               let removed = recoveryJournal.first {
             recoveryJournal.removeFirst()
             recoveryJournalBytes -= removed.envelope.payload.count
         }
     }
 
-    // MARK: - Private Helpers
+    // MARK: - Helpers privados
 
-    private func makeEnvelope<Message: Encodable & Sendable>(
-        _ message: Message,
-        channel: RoomChannel,
+    private func makeEnvelope(
+        _ message: some Encodable & Sendable,
+        channel: Channel,
         activityID: ActivityID?,
         delivery: DeliveryMode,
         coalescingKey: String?
-    ) -> RoomEnvelope? {
+    ) -> Envelope? {
         sequence &+= 1
 
-        guard let envelope = try? RoomEnvelope(
+        guard let envelope = try? Envelope(
             roomID: roomID,
             activityID: activityID,
             channel: channel,
-            senderApplicationID: identity.applicationID,
+            senderDeviceID: identity.deviceID,
             message: message,
             deliveryMode: delivery,
             coalescingKey: coalescingKey,
             sequence: sequence
-        ), envelope.payload.count <= P2PLimits.maximumEnvelopeBytes else {
+        ), envelope.payload.count <= Limits.maximumEnvelopeBytes else {
             return nil
         }
         return envelope

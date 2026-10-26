@@ -1,12 +1,9 @@
-//
-//  RoomMembership.swift
-//  Nexo
-//
+import Foundation
 
 @NexoActor
 final class RoomMembership {
     private(set) var members: [RoomMember] = []
-    private var membersByID: [String: RoomMember] = [:]
+    private var membersByID: [DeviceID: RoomMember] = [:]
 
     init(members: [RoomMember] = []) {
         update(members)
@@ -14,11 +11,11 @@ final class RoomMembership {
 
     func update(_ members: [RoomMember]) {
         var sanitized: [RoomMember] = []
-        var index: [String: RoomMember] = [:]
-        // Remote snapshots can repeat identities; the first occurrence wins.
-        for member in members where index[member.applicationID] == nil {
+        var index: [DeviceID: RoomMember] = [:]
+        // Los snapshots remotos pueden repetir identidades; gana la primera.
+        for member in members where index[member.deviceID] == nil {
             sanitized.append(member)
-            index[member.applicationID] = member
+            index[member.deviceID] = member
         }
         membersByID = index
         self.members = sanitized
@@ -28,26 +25,25 @@ final class RoomMembership {
         _ members: [RoomMember],
         descriptor: RoomDescriptor,
         roomID: RoomID,
-        requiring applicationIDs: Set<String>
+        requiring deviceIDs: Set<DeviceID>
     ) -> Bool {
-        let memberIDs = Set(members.map(\.applicationID))
+        let memberIDs = Set(members.map(\.deviceID))
         return descriptor.id == roomID
-            && P2PProtocolInfo.isCompatible(remoteVersion: descriptor.protocolVersion)
+            && ProtocolInfo.isCompatible(remoteVersion: descriptor.protocolVersion)
             && !members.isEmpty
-            && members.count <= P2PLimits.recoveryMemberLimit
+            && members.count <= Limits.recoveryMemberLimit
             && memberIDs.count == members.count
-            && !memberIDs.contains("")
-            && applicationIDs.isSubset(of: memberIDs)
-            && members.filter(\.isHost).map(\.applicationID) == [descriptor.hostApplicationID]
+            && deviceIDs.isSubset(of: memberIDs)
+            && members.filter(\.isHost).map(\.deviceID) == [descriptor.hostDeviceID]
             && descriptor.memberCount == members.count
             && (descriptor.capacity.map { $0 > 0 && members.count <= $0 } ?? true)
     }
 
-    func member(_ applicationID: String) -> RoomMember? {
-        membersByID[applicationID]
+    func member(_ deviceID: DeviceID) -> RoomMember? {
+        membersByID[deviceID]
     }
 
-    func contains(_ applicationID: String) -> Bool {
-        membersByID[applicationID] != nil
+    func contains(_ deviceID: DeviceID) -> Bool {
+        membersByID[deviceID] != nil
     }
 }

@@ -1,14 +1,9 @@
-//
-//  ActivityModels.swift
-//  Nexo
-//
-
 import Foundation
 
 // MARK: - ActivityID
 
-/// Identifies one activity instance within a room. A room can host several
-/// live activities, and a rematch gets a new ID.
+/// Identifica una instancia de actividad dentro de una sala. Una sala puede
+/// alojar varias actividades vivas, y una revancha obtiene un ID nuevo.
 public struct ActivityID: Hashable, Codable, Sendable, Identifiable, CustomStringConvertible {
     public let rawValue: UUID
 
@@ -22,12 +17,12 @@ public struct ActivityID: Hashable, Codable, Sendable, Identifiable, CustomStrin
 
 // MARK: - ActivityKind
 
-/// Open identifier for an activity type.
+/// Identificador abierto de un tipo de actividad.
 ///
-/// Nexo ships none: each game declares its own `static let` in its own module,
-/// e.g. `extension ActivityKind { static let sudoku = ActivityKind("sudoku") }`.
-/// Title, icon and other presentation metadata belong in the app's catalog,
-/// never here.
+/// Nexo no incluye ninguno: cada juego declara el suyo en su propio módulo, p. ej.
+/// `extension ActivityKind { static let sudoku = ActivityKind("sudoku") }`.
+/// El título, icono y demás metadatos de presentación viven en el catálogo de la
+/// app, nunca aquí.
 public struct ActivityKind: RawRepresentable, Hashable, Codable, Sendable, Identifiable {
     public let rawValue: String
 
@@ -47,39 +42,39 @@ public struct ActivityKind: RawRepresentable, Hashable, Codable, Sendable, Ident
 public enum ActivityState: String, Codable, Sendable {
     case lobby
     case running
-    /// Finished; the UI shows the result before it's torn down.
+    /// Terminada; la UI muestra el resultado antes de desmontarla.
     case finished
     case cancelled
 }
 
 // MARK: - ActivityDescriptor
 
-/// Transportable description of an activity.
+/// Descripción transportable de una actividad.
 public struct ActivityDescriptor: Codable, Hashable, Sendable, Identifiable {
     public let id: ActivityID
     public let roomID: RoomID
     public let kind: ActivityKind
-    /// Authority for this activity. May differ from the room's host.
-    public var hostApplicationID: String
-    /// Increased whenever activity authority moves to another participant.
+    /// Autoridad de esta actividad. Puede diferir del host de la sala.
+    public var hostDeviceID: DeviceID
+    /// Se incrementa cada vez que la autoridad de la actividad pasa a otro participante.
     public var hostGeneration: UInt64
-    public var participantIDs: Set<String>
+    public var participantIDs: Set<DeviceID>
     public var state: ActivityState
-    /// `true` if open to the whole room, so members who join later are
-    /// auto-admitted while still `.lobby`. `false` if the host hand-picked
-    /// the participants.
+    /// `true` si está abierta a toda la sala, de modo que los miembros que entren
+    /// más tarde se admiten automáticamente mientras siga en `.lobby`. `false` si
+    /// el host eligió a mano los participantes.
     public let admitsRoomMembers: Bool
-    /// `true` if only one instance of this kind can be active at a time in the
-    /// room (a game). `false` if it can run alongside any other active
-    /// activity (e.g. chat).
+    /// `true` si solo puede haber una instancia de este tipo activa a la vez en la
+    /// sala (un juego). `false` si puede correr junto a cualquier otra actividad
+    /// activa (p. ej. chat).
     public let isExclusive: Bool
 
     public init(
         id: ActivityID = ActivityID(),
         roomID: RoomID,
         kind: ActivityKind,
-        hostApplicationID: String,
-        participantIDs: Set<String>,
+        hostDeviceID: DeviceID,
+        participantIDs: Set<DeviceID>,
         hostGeneration: UInt64 = 0,
         state: ActivityState = .lobby,
         admitsRoomMembers: Bool = true,
@@ -88,7 +83,7 @@ public struct ActivityDescriptor: Codable, Hashable, Sendable, Identifiable {
         self.id = id
         self.roomID = roomID
         self.kind = kind
-        self.hostApplicationID = hostApplicationID
+        self.hostDeviceID = hostDeviceID
         self.hostGeneration = hostGeneration
         self.participantIDs = participantIDs
         self.state = state
@@ -96,22 +91,22 @@ public struct ActivityDescriptor: Codable, Hashable, Sendable, Identifiable {
         self.isExclusive = isExclusive
     }
 
-    /// Lenient decoding for peers that don't send the newer fields.
-    public init(from decoder: Decoder) throws {
+    /// Decodificación tolerante para peers que no envían los campos nuevos.
+    public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(ActivityID.self, forKey: .id)
         roomID = try container.decode(RoomID.self, forKey: .roomID)
         kind = try container.decode(ActivityKind.self, forKey: .kind)
-        hostApplicationID = try container.decode(String.self, forKey: .hostApplicationID)
+        hostDeviceID = try container.decode(DeviceID.self, forKey: .hostDeviceID)
         hostGeneration = try container.decodeIfPresent(UInt64.self, forKey: .hostGeneration) ?? 0
-        participantIDs = try container.decode(Set<String>.self, forKey: .participantIDs)
+        participantIDs = try container.decode(Set<DeviceID>.self, forKey: .participantIDs)
         state = try container.decode(ActivityState.self, forKey: .state)
         admitsRoomMembers = try container.decodeIfPresent(Bool.self, forKey: .admitsRoomMembers) ?? true
         isExclusive = try container.decodeIfPresent(Bool.self, forKey: .isExclusive) ?? true
     }
 
-    public func includes(_ applicationID: String) -> Bool {
-        participantIDs.contains(applicationID)
+    public func includes(_ deviceID: DeviceID) -> Bool {
+        participantIDs.contains(deviceID)
     }
 
     public var isActive: Bool { state == .lobby || state == .running }
