@@ -324,12 +324,13 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
         let options = NWProtocolTLS.Options()
         let security = options.securityProtocolOptions
 
-        let pskData = crypto.psk.withUnsafeBytes { DispatchData(bytes: $0) }
-        let identityData = Data(crypto.pskHint.utf8).withUnsafeBytes { DispatchData(bytes: $0) }
+        // DIAGNÓSTICO TEMPORAL — quitar tras depurar PSK.
+        print("[Nexo PSK] hint=\(crypto.pskHint) pskBytes=\(crypto.psk.count)")
+
         sec_protocol_options_add_pre_shared_key(
             security,
-            pskData as __DispatchData,
-            identityData as __DispatchData
+            Self.dispatchData(crypto.psk) as __DispatchData,
+            Self.dispatchData(Data(crypto.pskHint.utf8)) as __DispatchData
         )
         sec_protocol_options_append_tls_ciphersuite(
             security,
@@ -338,6 +339,15 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
         sec_protocol_options_set_min_tls_protocol_version(security, .TLSv12)
         sec_protocol_options_set_max_tls_protocol_version(security, .TLSv12)
         return options
+    }
+
+    /// Construye un `DispatchData` que copia los bytes del `Data` de forma segura
+    /// (construir el `DispatchData` dentro del `withUnsafeBytes` con el buffer
+    /// explícito evita que el puntero se escape).
+    static func dispatchData(_ data: Data) -> DispatchData {
+        data.withUnsafeBytes { raw in
+            DispatchData(bytes: UnsafeRawBufferPointer(start: raw.baseAddress, count: raw.count))
+        }
     }
 
     /// Parámetros Bonjour P2P con el framer de longitud y TLS-PSK sobre TCP.
