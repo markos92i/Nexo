@@ -30,14 +30,6 @@ extension RoomService {
             }
         }
         let advertisement = discovery.advertisement(forEndpoint: room.advertisedBy)
-        // DIAGNÓSTICO TEMPORAL — quitar tras depurar el join.
-        print("""
-        [Nexo join] advertisedBy=\(room.advertisedBy.rawValue)
-        [Nexo join] advertisement encontrado=\(advertisement != nil)
-        [Nexo join] advertisement.deviceID=\(advertisement?.deviceID?.description ?? "nil")
-        [Nexo join] room.descriptor.hostDeviceID=\(room.descriptor.hostDeviceID.description)
-        [Nexo join] endpoints conocidos=\(discovery.rooms.keys.map { $0.shortCode })
-        """)
         guard let advertisement,
               advertisement.deviceID == room.descriptor.hostDeviceID else {
             throw RoomError.peerUnavailable

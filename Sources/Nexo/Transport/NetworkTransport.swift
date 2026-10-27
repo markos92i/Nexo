@@ -324,9 +324,6 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
         let options = NWProtocolTLS.Options()
         let security = options.securityProtocolOptions
 
-        // DIAGNÓSTICO TEMPORAL — quitar tras depurar PSK.
-        print("[Nexo PSK] hint=\(crypto.pskHint) pskBytes=\(crypto.psk.count)")
-
         sec_protocol_options_add_pre_shared_key(
             security,
             Self.dispatchData(crypto.psk) as __DispatchData,
@@ -474,13 +471,6 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
                 endpointID: endpointID,
                 fallbackName: name.isEmpty ? endpointID.description : name
             )
-            // DIAGNÓSTICO TEMPORAL — quitar tras depurar.
-            print("""
-            [Nexo browse] endpointID=\(endpointID.rawValue)
-            [Nexo browse] txt keys=\(txt.keys.sorted())
-            [Nexo browse] record.deviceID=\(record.deviceID?.description ?? "nil")
-            [Nexo browse] rooms=\(record.rooms.count) hostIDs=\(record.rooms.map { $0.hostDeviceID.description })
-            """)
             // Filtra el propio dispositivo.
             guard record.deviceID != deviceID else { continue }
 
@@ -744,7 +734,7 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
 
     /// Bucle de recepción. Captura sólo `[weak self]`, la NWConnection y sessionID.
     private func startReceiving(_ sessionID: UUID, on nwConnection: NWConnection) {
-        nwConnection.receiveMessage { [weak self] data, _, isComplete, error in
+        nwConnection.receiveMessage { [weak self] data, context, isComplete, error in
             Task { [weak self] in
                 guard let self else { return }
                 if let data, !data.isEmpty {
@@ -754,8 +744,9 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
                     await self.failSession(sessionID, error: error)
                     return
                 }
-                if isComplete {
-                    // Fin de stream: el peer cerró.
+                // With a framer, `isComplete` marks the end of each message, not of
+                // the stream. Only a final context (or an empty completion) is EOF.
+                if isComplete, context?.isFinal == true || data == nil {
                     await self.failSession(sessionID, error: TransportError.connectionFailed(.connectionClosed))
                     return
                 }
