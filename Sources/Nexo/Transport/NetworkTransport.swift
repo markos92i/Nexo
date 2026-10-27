@@ -464,6 +464,13 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
                 endpointID: endpointID,
                 fallbackName: name.isEmpty ? endpointID.description : name
             )
+            // DIAGNÓSTICO TEMPORAL — quitar tras depurar.
+            print("""
+            [Nexo browse] endpointID=\(endpointID.rawValue)
+            [Nexo browse] txt keys=\(txt.keys.sorted())
+            [Nexo browse] record.deviceID=\(record.deviceID?.description ?? "nil")
+            [Nexo browse] rooms=\(record.rooms.count) hostIDs=\(record.rooms.map { $0.hostDeviceID.description })
+            """)
             // Filtra el propio dispositivo.
             guard record.deviceID != deviceID else { continue }
 
