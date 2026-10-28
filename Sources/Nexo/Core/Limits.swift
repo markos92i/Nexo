@@ -35,5 +35,12 @@ public enum Limits {
     public static let advertisedRoomLimit = 3
 
     public static let handshakeTimeout: Duration = .seconds(12)
+    /// Plazo para conectar con el host al entrar en una sala. Algo mayor que el
+    /// handshake, que ya acota la conexión física.
+    public static let joinConnectTimeout: Duration = .seconds(15)
+    /// Plazo para que el host responda una vez conectados. Depende de que una
+    /// persona acepte, así que es largo; la UI permite cancelar antes.
+    public static let joinApprovalTimeout: Duration = .seconds(120)
+    /// Plazo de una re-entrada automática tras reconectar, sin persona de por medio.
     public static let joinTimeout: Duration = .seconds(30)
 }

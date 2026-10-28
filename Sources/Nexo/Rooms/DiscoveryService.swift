@@ -57,13 +57,12 @@ final class DiscoveryService {
 
     // MARK: - Consultas de presentación
 
-    /// Salas disponibles para unirse, en orden estable. `activeSessions` filtra
-    /// las que el usuario ya tiene unidas o esperando aprobación.
+    /// Salas disponibles para unirse, en orden estable, sin las ya unidas.
     func availableRooms(
-        isJoinedOrAwaiting: (RoomID) -> Bool
+        isJoined: (RoomID) -> Bool
     ) -> [DiscoveredRoom] {
         directory.rooms.values
-            .filter { !isJoinedOrAwaiting($0.id) }
+            .filter { !isJoined($0.id) }
             .sorted { lhs, rhs in
                 if lhs.name == rhs.name { return lhs.id.description < rhs.id.description }
                 return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
@@ -74,9 +73,9 @@ final class DiscoveryService {
     /// listar partidas sin pasar por el chat.
     func availableRooms(
         for kind: ActivityKind,
-        isJoinedOrAwaiting: (RoomID) -> Bool
+        isJoined: (RoomID) -> Bool
     ) -> [DiscoveredRoom] {
-        availableRooms(isJoinedOrAwaiting: isJoinedOrAwaiting)
+        availableRooms(isJoined: isJoined)
             .filter { $0.activityKind == kind && $0.features.hasActivities }
     }
 }

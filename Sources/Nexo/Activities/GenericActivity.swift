@@ -28,24 +28,38 @@ open class GenericActivity<Message: Codable & Sendable>: Activity {
     public let context: ActivityContext
     public var onDescriptorChange: (@NexoActor () -> Void)?
 
-    /// Flujo de eventos para la UI. Un consumidor; su cancelación desconecta al
-    /// lector sin afectar a la actividad.
+    /// Flujo de eventos para la UI. Su cancelación desconecta al lector sin
+    /// afectar a la actividad.
+    ///
+    /// Los eventos que llegan antes de que haya ningún lector (por ejemplo, el
+    /// "listo" de otro jugador que entra mientras la UI aún se engancha) se
+    /// guardan y se entregan al primer lector, en orden. Sin esto la app tendría
+    /// que reenviar su estado periódicamente por si alguien se lo perdió.
     public nonisolated var events: AsyncStream<ActivityEvent<Message>> {
         let id = UUID()
         let (stream, continuation) = AsyncStream.makeStream(
             of: ActivityEvent<Message>.self,
-            bufferingPolicy: .bufferingNewest(256)
+            bufferingPolicy: .bufferingNewest(Self.pendingEventLimit)
         )
         continuation.onTermination = { [weak self] _ in
             Task { @NexoActor in self?.continuations.removeValue(forKey: id) }
         }
         Task { @NexoActor [weak self] in
-            guard let self, !self.isEnded else { continuation.finish(); return }
-            self.continuations[id] = continuation
+            guard let self else { continuation.finish(); return }
+            for event in self.pendingEvents { continuation.yield(event) }
+            self.pendingEvents.removeAll()
+            if self.isEnded {
+                continuation.finish()
+            } else {
+                self.continuations[id] = continuation
+            }
         }
         return stream
     }
     private var continuations: [UUID: AsyncStream<ActivityEvent<Message>>.Continuation] = [:]
+    /// Eventos emitidos sin lectores, a la espera del primero.
+    private var pendingEvents: [ActivityEvent<Message>] = []
+    private nonisolated static var pendingEventLimit: Int { 256 }
     private var isEnded = false
 
     public var isLocalHost: Bool { descriptor.hostDeviceID == context.identity.deviceID }
@@ -166,6 +180,11 @@ open class GenericActivity<Message: Codable & Sendable>: Activity {
     }
 
     private func emit(_ event: ActivityEvent<Message>) {
+        guard !continuations.isEmpty else {
+            if pendingEvents.count == Self.pendingEventLimit { pendingEvents.removeFirst() }
+            pendingEvents.append(event)
+            return
+        }
         for continuation in continuations.values {
             continuation.yield(event)
         }

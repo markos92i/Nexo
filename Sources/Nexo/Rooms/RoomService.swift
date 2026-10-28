@@ -4,6 +4,7 @@
 //
 
 import Foundation
+import OSLog
 
 // MARK: - RoomTransferHandling
 
@@ -39,9 +40,13 @@ public protocol RoomTransferHandling: TransferURLProviding {
 /// sesiones observar y qué aspecto tiene la lista de salas.
 public struct RoomsSnapshot: Sendable {
     public let sessionIDs: [RoomID]
+    /// Salas cercanas que aún no se han unido. Una sala con una entrada en curso
+    /// sigue aquí, con su progreso en `joinProgress`.
     public let availableRooms: [DiscoveredRoom]
     public let activeRoomID: RoomID?
     public let sessionInstances: [RoomID: UUID]
+    /// Entradas en curso iniciadas por el usuario con `join(_:)`.
+    public let joinProgress: [RoomID: JoinProgress]
     public let revision: UInt64
 
     public init(
@@ -49,14 +54,27 @@ public struct RoomsSnapshot: Sendable {
         availableRooms: [DiscoveredRoom],
         activeRoomID: RoomID?,
         sessionInstances: [RoomID: UUID] = [:],
+        joinProgress: [RoomID: JoinProgress] = [:],
         revision: UInt64 = 0
     ) {
         self.sessionIDs = sessionIDs
         self.availableRooms = availableRooms
         self.activeRoomID = activeRoomID
         self.sessionInstances = sessionInstances
+        self.joinProgress = joinProgress
         self.revision = revision
     }
+}
+
+// MARK: - JoinProgress
+
+/// Fase de una entrada a sala en curso, para mostrar el progreso en la UI.
+public enum JoinProgress: Sendable, Equatable {
+    /// Abriendo la conexión cifrada con el host.
+    case connecting
+    /// Conectado; esperando a que el host acepte (o a la aceptación automática
+    /// de una sala abierta).
+    case awaitingApproval
 }
 
 // MARK: - RoomService
@@ -81,6 +99,9 @@ public final class RoomService {
     /// Última sala con la que el usuario interactuó. La UI de primera parte se
     /// centra en una sala activa, pero el registro admite varias.
     public internal(set) var activeRoomID: RoomID?
+
+    /// Pasos de entrada y salida de salas. Filtra por `category:rooms`.
+    nonisolated static let log = Logger(subsystem: "com.nexo", category: "rooms")
 
     // MARK: - Dependencias
 
@@ -135,7 +156,30 @@ public final class RoomService {
 
     private var noticeContinuations: [UUID: AsyncStream<RoomNotice>.Continuation] = [:]
     private var snapshotContinuations: [UUID: AsyncStream<RoomsSnapshot>.Continuation] = [:]
+    private var transportEventContinuations: [UUID: AsyncStream<TransportEvent>.Continuation] = [:]
     private var revision: UInt64 = 0
+    private var eventTask: Task<Void, Never>?
+    private var byteStreamTask: Task<Void, Never>?
+    private let incomingByteStreamPair = AsyncStream.makeStream(
+        of: IncomingByteStream.self,
+        bufferingPolicy: .bufferingOldest(16)
+    )
+
+    /// Eventos del transporte ya aplicados a las salas, para la presentación
+    /// (anuncios, peers conectados, estado de la red). No incluye los envelopes
+    /// recibidos: esos solo los consume Nexo. Cada suscriptor recibe todos los
+    /// eventos desde que se suscribe.
+    public var transportEvents: AsyncStream<TransportEvent> {
+        let token = UUID()
+        let pair = AsyncStream.makeStream(of: TransportEvent.self, bufferingPolicy: .unbounded)
+        pair.continuation.onTermination = { [weak self] _ in
+            Task { @NexoActor [weak self] in
+                self?.transportEventContinuations.removeValue(forKey: token)
+            }
+        }
+        transportEventContinuations[token] = pair.continuation
+        return pair.stream
+    }
 
     /// Cada consumidor posee su suscripción; cancelar una vista no para a las demás.
     public var notices: AsyncStream<RoomNotice> {
@@ -188,8 +232,18 @@ public final class RoomService {
             availableRooms: availableRooms,
             activeRoomID: activeRoomID,
             sessionInstances: sessions.mapValues(\.instanceID),
+            joinProgress: joinProgress,
             revision: revision
         )
+    }
+
+    /// Entradas en curso iniciadas con `join(_:)`. Las re-entradas automáticas
+    /// tras una reconexión no cuentan: la sala ya está unida.
+    public var joinProgress: [RoomID: JoinProgress] {
+        pendingJoins.compactMapValues { operation in
+            guard !operation.isRecovery else { return nil }
+            return operation.roomToJoin == nil ? .awaitingApproval : .connecting
+        }
     }
 
     func publishRooms() {
@@ -237,22 +291,22 @@ public final class RoomService {
     }
 
     /// Salas descubiertas listas para mostrar, en orden estable.
+    /// Una sala en espera de aprobación sigue en la lista: la UI la pinta con su
+    /// `joinProgress` en vez de hacerla desaparecer.
     public var availableRooms: [DiscoveredRoom] {
-        discovery.availableRooms { roomID in
-            guard let session = sessions[roomID] else { return false }
-            // Una sesión que se está reconectando no debe ocultar la sala: si el
-            // host sigue anunciándola, el usuario debe poder reunirse.
-            return session.accessState == .joined || session.accessState == .awaitingApproval
-        }
+        discovery.availableRooms(isJoined: isJoined)
     }
 
     /// Salas descubiertas que ofrecen la actividad dada. Lo que usa el lobby de un
     /// juego para listar partidas sin pasar por el chat.
     public func availableRooms(for kind: ActivityKind) -> [DiscoveredRoom] {
-        discovery.availableRooms(for: kind) { roomID in
-            guard let session = sessions[roomID] else { return false }
-            return session.accessState == .joined || session.accessState == .awaitingApproval
-        }
+        discovery.availableRooms(for: kind, isJoined: isJoined)
+    }
+
+    /// Una sesión que se está reconectando no oculta la sala: si el host sigue
+    /// anunciándola, el usuario debe poder volver a entrar.
+    private func isJoined(_ roomID: RoomID) -> Bool {
+        sessions[roomID]?.accessState == .joined
     }
 
     /// Pide el catálogo autoritativo de salas a cada peer conectado. El TXT de
@@ -273,10 +327,57 @@ public final class RoomService {
         store: (any MessageStore)? = nil
     ) {
         self.transport = transport
-        self.binaryTransport = transport as? any BinaryStreamOpening
+        let binaryTransport = transport as? any BinaryStreamOpening
+        self.binaryTransport = binaryTransport
         self.identity = identity
         self.registry = registry ?? ActivityRegistry()
         self.store = store ?? InMemoryMessageStore()
+
+        // El servicio es el único lector de los eventos del transporte: la app no
+        // tiene que reenviarlos, y no puede olvidarse de hacerlo.
+        let events = transport.events
+        eventTask = Task { @NexoActor [weak self] in
+            for await event in events {
+                guard let self else { return }
+                self.handle(event)
+                self.forward(event)
+            }
+        }
+
+        if let incoming = binaryTransport?.incomingByteStreams {
+            byteStreamTask = Task { @NexoActor [weak self] in
+                for await stream in incoming {
+                    guard let self else { return }
+                    self.admitIncomingByteStream(stream)
+                }
+            }
+        }
+    }
+
+    /// Solo entrega streams de miembros unidos a la sala que declara el stream.
+    private func admitIncomingByteStream(_ incoming: IncomingByteStream) {
+        guard let session = sessions[incoming.descriptor.roomID],
+              session.accessState == .joined,
+              session.contains(incoming.senderDeviceID),
+              incoming.senderDeviceID != identity.deviceID else {
+            // Dejar de iterar el stream lo cancela y avisa al emisor.
+            return
+        }
+        incomingByteStreamPair.continuation.yield(incoming)
+    }
+
+    private func forward(_ event: TransportEvent) {
+        if case .received = event { return }
+        guard event.epoch == transport.epoch else { return }
+        for continuation in transportEventContinuations.values { continuation.yield(event) }
+    }
+
+    /// Prepara las salas para que el transporte se pare de forma temporal (por
+    /// ejemplo, al pasar a segundo plano). La membresía se conserva para
+    /// recuperarse al volver. Llamar después de `transport.stop()`.
+    public func suspend() {
+        handleLifecycle(.suspended)
+        forgetDiscoveredPeers()
     }
 
     /// Enchufa el servicio de transferencias (Fase 6). Antes de llamarlo, el
@@ -294,10 +395,14 @@ public final class RoomService {
             operation.timeoutTask?.cancel()
             operation.continuation?.resume(throwing: CancellationError())
         }
+        eventTask?.cancel()
+        byteStreamTask?.cancel()
+        incomingByteStreamPair.continuation.finish()
         for task in recoveryTasks.values { task.cancel() }
         for task in hostMigrationTasks.values { task.cancel() }
         for continuation in noticeContinuations.values { continuation.finish() }
         for continuation in snapshotContinuations.values { continuation.finish() }
+        for continuation in transportEventContinuations.values { continuation.finish() }
     }
 
     public func registerActivity(_ kind: ActivityKind, factory: @escaping ActivityRegistry.Factory) {
@@ -380,6 +485,7 @@ public final class RoomService {
 
         for session in sessions.values {
             transfers?.cancelAll(in: session)
+            session.removeAllJoinRequests()
             session.removeAllActivities(reason: reason)
             session.setAccessState(.closed(reason: reason))
         }
@@ -422,15 +528,15 @@ public final class RoomService {
         in roomID: RoomID,
         mimeType: String = "application/octet-stream",
         name: String? = nil
-    ) async throws -> QUICByteStream {
+    ) async throws -> ByteStreamWriter {
         guard let session = sessions[roomID] else { throw RoomError.roomNotFound }
         guard session.accessState == .joined else { throw RoomError.notAMember }
         guard session.contains(deviceID), deviceID != identity.deviceID else { throw RoomError.notAMember }
         guard let binary = binaryTransport else {
-            throw RoomError.featureUnavailable(.activities)
+            throw RoomError.transportFailure(.binaryStreamsUnsupported)
         }
         let descriptor = ByteStreamDescriptor(roomID: roomID, mimeType: mimeType, name: name)
-        let result: Result<QUICByteStream, TransportError>
+        let result: Result<ByteStreamWriter, TransportError>
         do {
             result = .success(try await binary.openByteStream(to: deviceID, descriptor: descriptor))
         } catch {
@@ -443,9 +549,10 @@ public final class RoomService {
     }
 
     /// Streams binarios entrantes de todos los peers (si el transporte los ofrece).
-    /// Cada stream trae su `ByteStreamDescriptor` (incluye el `roomID`).
-    public var incomingByteStreams: AsyncStream<QUICIncomingStream> {
-        binaryTransport?.incomingByteStreams ?? AsyncStream { $0.finish() }
+    /// Cada stream trae su `ByteStreamDescriptor` (incluye el `roomID`) y el
+    /// emisor. Un único consumidor.
+    public var incomingByteStreams: AsyncStream<IncomingByteStream> {
+        incomingByteStreamPair.stream
     }
 
     func makeSession(descriptor: RoomDescriptor, accessState: RoomAccessState) -> Room {
@@ -468,6 +575,15 @@ public final class RoomService {
         )
         if let transfers {
             session.bindTransfers(transfers)
+        }
+        session.onJoinRequestsRemoved = { [weak self] removed in
+            for request in removed {
+                self?.publishNotice(.joinRequestResolved(JoinRequestNotice(
+                    requestID: request.id,
+                    roomID: request.roomID,
+                    displayName: request.displayName
+                )))
+            }
         }
         return session
     }

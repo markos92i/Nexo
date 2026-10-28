@@ -48,7 +48,9 @@ public enum TransportEvent: Sendable {
 /// - `events` se entrega en el ejecutor que elija el consumidor.
 public protocol Transport: Sendable {
 
-    /// Flujo único de eventos. Tiene un consumidor: la capa de salas.
+    /// Flujo único de eventos. Tiene un consumidor: `RoomService`, que lo lee
+    /// desde su init. Nunca descarta eventos: perder un `peerConnected` o un
+    /// `peerDisconnected` dejaría la lista de peers desincronizada.
     var events: AsyncStream<TransportEvent> { get }
 
     /// Generación asignada de forma síncrona al iniciar o detener una sesión.
@@ -90,8 +92,8 @@ public protocol Transport: Sendable {
 
 // MARK: - BinaryStreamOpening
 
-/// Capacidad opcional de un transporte: abrir un canal binario de alta velocidad
-/// (QUIC) hacia un peer, para streaming de datos densos.
+/// Capacidad opcional de un transporte: abrir streams binarios de alta velocidad
+/// hacia un peer, por una conexión dedicada, para datos densos.
 ///
 /// Es un protocolo aparte porque no todo transporte la ofrece (p. ej. un mock de
 /// tests no). `RoomService` la usa solo si su transporte la implementa.
@@ -101,8 +103,8 @@ public protocol BinaryStreamOpening: Sendable {
     func openByteStream(
         to deviceID: DeviceID,
         descriptor: ByteStreamDescriptor
-    ) async throws(TransportError) -> QUICByteStream
+    ) async throws(TransportError) -> ByteStreamWriter
 
     /// Streams binarios entrantes de todos los peers. Un único consumidor.
-    var incomingByteStreams: AsyncStream<QUICIncomingStream> { get }
+    var incomingByteStreams: AsyncStream<IncomingByteStream> { get }
 }

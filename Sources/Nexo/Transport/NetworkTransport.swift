@@ -26,7 +26,10 @@ import Synchronization
 /// `deviceID`) y `[weak self]`, nunca la clase completa.
 public actor NetworkTransport: Transport, BinaryStreamOpening {
 
-    private static let logger = Logger(subsystem: "com.zafir.nexo", category: "transport")
+    private static let logger = Logger(subsystem: "com.nexo", category: "transport")
+    /// Ciclo de vida de cada conexión física: apertura, estados, hello y cierre
+    /// con su motivo y quién lo inició. Filtra por `category:connection`.
+    private static let connectionLog = Logger(subsystem: "com.nexo", category: "connection")
 
     // MARK: Estado compartido sin aislamiento (leído de forma síncrona)
 
@@ -59,6 +62,7 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
 
     private let crypto: SessionCrypto
     private let deviceID: DeviceID
+    private let service: ServiceType
 
     // MARK: Estado aislado al actor
 
@@ -75,13 +79,16 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
 
     private var listener: NWListener?
     private var browser: NWBrowser?
+    /// TXT publicado ahora mismo. Volver a asignar `listener.service` registra
+    /// otra vez el servicio en Bonjour, así que solo se hace si el TXT cambia.
+    private var publishedTXT: [String: String]?
 
-    /// Canales QUIC binarios por peer (capacidad `BinaryStreamOpening`). Se crean
-    /// perezosamente al abrir el primer stream a un peer, o al aceptar uno suyo.
-    private var binaryChannels: [DeviceID: QUICChannel] = [:]
-    private let incomingByteStreamContinuation: AsyncStream<QUICIncomingStream>.Continuation
-    private let incomingByteStreamStream: AsyncStream<QUICIncomingStream>
-    public nonisolated var incomingByteStreams: AsyncStream<QUICIncomingStream> { incomingByteStreamStream }
+    /// Canal binario por peer (capacidad `BinaryStreamOpening`). Vive en su propia
+    /// conexión física; se crea al abrir el primer stream o al aceptar uno.
+    private var binaryChannels: [DeviceID: BinaryChannel] = [:]
+    private let incomingByteStreamContinuation: AsyncStream<IncomingByteStream>.Continuation
+    private let incomingByteStreamStream: AsyncStream<IncomingByteStream>
+    public nonisolated var incomingByteStreams: AsyncStream<IncomingByteStream> { incomingByteStreamStream }
     private var listenerRetry: Task<Void, Never>?
     private var browserRetry: Task<Void, Never>?
     private var listenerRetryAttempt = 0
@@ -100,19 +107,29 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
 
     // MARK: Init
 
-    public init(crypto: SessionCrypto, deviceID: DeviceID, displayName: String) {
+    /// - Parameter service: tipo Bonjour propio de la app. Debe coincidir con
+    ///   `NSBonjourServices` en su Info.plist.
+    public init(
+        crypto: SessionCrypto,
+        deviceID: DeviceID,
+        displayName: String,
+        service: ServiceType = .nexo
+    ) {
         self.crypto = crypto
         self.deviceID = deviceID
+        self.service = service
         self.advertisement = AdvertisementRecord(deviceID: deviceID, displayName: displayName)
 
-        let events = AsyncStream<TransportEvent>.makeStream(bufferingPolicy: .bufferingNewest(64))
+        // Sin límite: el único consumidor (`RoomService`) lee en cuanto llegan, y
+        // descartar un evento de conexión desincronizaría la lista de peers.
+        let events = AsyncStream<TransportEvent>.makeStream(bufferingPolicy: .unbounded)
         self.eventStream = events.stream
         self.eventContinuation = events.continuation
 
         let signals = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
         self.wakeup = signals.continuation
 
-        let binary = AsyncStream<QUICIncomingStream>.makeStream(bufferingPolicy: .bufferingOldest(16))
+        let binary = AsyncStream<IncomingByteStream>.makeStream(bufferingPolicy: .bufferingOldest(16))
         self.incomingByteStreamStream = binary.stream
         self.incomingByteStreamContinuation = binary.continuation
 
@@ -287,6 +304,7 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
 
         listener?.cancel()
         listener = nil
+        publishedTXT = nil
         browser?.cancel()
         browser = nil
 
@@ -370,11 +388,13 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
             handleStackFailure(.listener, epoch: token, error: error)
             return
         }
+        let txt = advertisement.txtDictionary
         listener.service = NWListener.Service(
             name: serviceName,
-            type: ProtocolInfo.serviceType,
-            txtRecord: NWTXTRecord(advertisement.txtDictionary)
+            type: service.bonjourType,
+            txtRecord: NWTXTRecord(txt)
         )
+        publishedTXT = txt
         self.listener = listener
 
         listener.stateUpdateHandler = { [weak self] state in
@@ -404,11 +424,14 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
 
     private func republishTXT() {
         guard let listener else { return }
+        let txt = advertisement.txtDictionary
+        guard txt != publishedTXT else { return }
         listener.service = NWListener.Service(
             name: serviceName,
-            type: ProtocolInfo.serviceType,
-            txtRecord: NWTXTRecord(advertisement.txtDictionary)
+            type: service.bonjourType,
+            txtRecord: NWTXTRecord(txt)
         )
+        publishedTXT = txt
     }
 
     // MARK: - Browser Bonjour
@@ -421,7 +444,7 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
         let params = NWParameters()
         params.includePeerToPeer = true
         let browser = NWBrowser(
-            for: .bonjourWithTXTRecord(type: ProtocolInfo.serviceType, domain: nil),
+            for: .bonjourWithTXTRecord(type: service.bonjourType, domain: nil),
             using: params
         )
         self.browser = browser
@@ -595,23 +618,31 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
         // Reutiliza una saliente pendiente al mismo endpoint, o abre una nueva.
         let connection: Connection
         if let pending = connectionsBySession.values.first(where: {
-            $0.isOutgoing && $0.endpointID == advertisement.endpointID && $0.peer == nil
+            $0.isOutgoing && $0.purpose == .control && $0.endpointID == advertisement.endpointID && $0.peer == nil
         }) {
             connection = pending
         } else {
             guard connectionsBySession.count < 64 else {
                 throw TransportError.connectionFailed(.connectionFailed)
             }
-            let nwConnection = NWConnection(to: endpoint, using: makeParameters())
             connection = register(
-                nwConnection,
+                NWConnection(to: endpoint, using: makeParameters()),
                 epoch: token,
                 outgoing: true,
+                purpose: .control,
                 endpointID: advertisement.endpointID,
                 expectedDeviceID: advertisement.deviceID
             )
         }
+        return try await awaitHandshake(of: connection, epoch: token)
+    }
 
+    /// Espera a que la conexión complete el hello. Varios llamadores pueden
+    /// esperar a la misma conexión.
+    private func awaitHandshake(
+        of connection: Connection,
+        epoch token: UInt64
+    ) async throws(TransportError) -> ConnectedPeer {
         let waiterID = UUID()
         let sessionID = connection.sessionID
         do {
@@ -654,7 +685,8 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
             nwConnection.cancel()
             return
         }
-        _ = register(nwConnection, epoch: token, outgoing: false)
+        // El propósito real lo declara el hello del peer que abre la conexión.
+        _ = register(nwConnection, epoch: token, outgoing: false, purpose: .control)
     }
 
     @discardableResult
@@ -662,6 +694,7 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
         _ nwConnection: NWConnection,
         epoch token: UInt64,
         outgoing: Bool,
+        purpose: ConnectionPurpose,
         endpointID: TransportPeerID? = nil,
         expectedDeviceID: DeviceID? = nil
     ) -> Connection {
@@ -669,11 +702,15 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
             nwConnection: nwConnection,
             epoch: token,
             outgoing: outgoing,
+            purpose: purpose,
             endpointID: endpointID,
             expectedDeviceID: expectedDeviceID
         )
         let sessionID = connection.sessionID
         connectionsBySession[sessionID] = connection
+        Self.connectionLog.info(
+            "\(Self.tag(sessionID), privacy: .public) open \(outgoing ? "outgoing" : "incoming", privacy: .public) \(purpose.rawValue, privacy: .public) expected=\(expectedDeviceID.map(Self.tag) ?? "-", privacy: .public)"
+        )
 
         // Cola de envío. Captura sólo la NWConnection (Sendable) y sessionID.
         connection.queue = SendQueue(
@@ -692,11 +729,9 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
                 Task { await self?.connectionReady(sessionID, epoch: token) }
             case .failed(let error):
                 Task { await self?.failSession(sessionID, error: error) }
-            case .cancelled:
-                break
             case .waiting(let error):
-                Task { await self?.failSession(sessionID, error: error) }
-            case .setup, .preparing:
+                Task { await self?.connectionWaiting(sessionID, error: error) }
+            case .cancelled, .setup, .preparing:
                 break
             @unknown default:
                 break
@@ -704,7 +739,8 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
         }
         nwConnection.start(queue: .global())
 
-        // Timeout de handshake: captura sólo sessionID.
+        // Timeout de handshake: captura sólo sessionID. También acota la espera
+        // de una conexión que se queda en `.waiting`.
         connection.timeoutTask = Task { [weak self] in
             do { try await Task.sleep(for: Limits.handshakeTimeout) } catch { return }
             await self?.handshakeTimedOut(sessionID)
@@ -713,13 +749,27 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
         return connection
     }
 
+    /// `.waiting` suele ser pasajero (por ejemplo, mientras AWDL levanta el
+    /// enlace), así que no se corta: el timeout de handshake pone el límite. Solo
+    /// un permiso de red local denegado es definitivo.
+    private func connectionWaiting(_ sessionID: UUID, error: NWError) async {
+        Self.connectionLog.info(
+            "\(Self.tag(sessionID), privacy: .public) waiting: \(String(describing: error), privacy: .public)"
+        )
+        guard LocalNetworkDenial.isDenied(error) else { return }
+        await failSession(sessionID, error: error)
+    }
+
     private func connectionReady(_ sessionID: UUID, epoch token: UInt64) async {
         guard isCurrent(token), let connection = connectionsBySession[sessionID] else { return }
-        // Envía el hello local y arranca el bucle de recepción.
+        Self.connectionLog.info("\(Self.tag(sessionID), privacy: .public) ready, sending hello")
+        // Quien abre la conexión declara su propósito; quien la acepta responde
+        // con `.control`, que el otro lado ignora.
         let hello = Frame.hello(HelloBody(
             deviceID: deviceID,
             displayName: advertisement.displayName,
-            pskHint: crypto.pskHint
+            pskHint: crypto.pskHint,
+            purpose: connection.isOutgoing ? connection.purpose : .control
         ))
         let nwConnection = connection.nwConnection
         connection.helloTask = Task { [weak self] in
@@ -747,6 +797,7 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
                 // With a framer, `isComplete` marks the end of each message, not of
                 // the stream. Only a final context (or an empty completion) is EOF.
                 if isComplete, context?.isFinal == true || data == nil {
+                    Self.connectionLog.info("\(Self.tag(sessionID), privacy: .public) remote closed the stream")
                     await self.failSession(sessionID, error: TransportError.connectionFailed(.connectionClosed))
                     return
                 }
@@ -764,6 +815,11 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
     private func receivedFrameData(_ data: Data, session sessionID: UUID) async {
         guard let connection = connectionsBySession[sessionID],
               isCurrent(connection.epoch), activeEpoch == connection.epoch else { return }
+        // Tras el hello, una conexión binaria transporta frames binarios, no JSON.
+        if let channel = connection.binaryChannel {
+            await channel.receive(data)
+            return
+        }
         let frame: Frame
         do {
             frame = try JSONDecoder().decode(Frame.self, from: data)
@@ -805,6 +861,9 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
 
         case .goodbye:
             let reason = frame.goodbye?.reason ?? .peerDisconnected
+            Self.connectionLog.info(
+                "\(Self.tag(connection.sessionID), privacy: .public) remote goodbye: \(String(describing: reason), privacy: .public)"
+            )
             await fail(connection, error: TransportError.connectionFailed(reason))
         }
     }
@@ -821,6 +880,15 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
               body.displayName.utf8.count <= 1024,
               connection.expectedDeviceID == nil || connection.expectedDeviceID == body.deviceID else {
             await fail(connection, error: TransportError.handshakeFailed(.invalidIdentity))
+            return
+        }
+
+        let purpose = connection.isOutgoing ? connection.purpose : (body.purpose ?? .control)
+        Self.connectionLog.info(
+            "\(Self.tag(connection.sessionID), privacy: .public) hello from \(Self.tag(body.deviceID), privacy: .public) \(purpose.rawValue, privacy: .public)"
+        )
+        if purpose == .byteStreams {
+            await completeByteStreamHandshake(body, on: connection)
             return
         }
 
@@ -855,6 +923,35 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
         emit(.peerConnected(peer, epoch: connection.epoch))
     }
 
+    /// Una conexión binaria solo se acepta de un peer que ya tiene conexión de
+    /// control: así hereda su identidad y nunca emite `peerConnected`.
+    private func completeByteStreamHandshake(_ body: HelloBody, on connection: Connection) async {
+        guard let control = connectionsByDevice[body.deviceID]?.peer,
+              body.capabilities.contains(.binaryStreams) else {
+            await fail(connection, error: TransportError.handshakeFailed(.invalidIdentity))
+            return
+        }
+        let sessionID = connection.sessionID
+        let nwConnection = connection.nwConnection
+        let channel = BinaryChannel(
+            peerDeviceID: body.deviceID,
+            writeFrame: { data in try await Self.sendMessage(data, identifier: "binary", on: nwConnection) },
+            onIncoming: { [weak self] stream in self?.forwardIncomingByteStream(stream) },
+            onClose: { [weak self] in
+                Task { await self?.failSession(sessionID, error: TransportError.connectionFailed(.connectionClosed)) }
+            }
+        )
+        connection.purpose = .byteStreams
+        connection.binaryChannel = channel
+        connection.peer = control
+        connection.timeoutTask?.cancel()
+        connection.timeoutTask = nil
+        if binaryChannels[body.deviceID] == nil {
+            binaryChannels[body.deviceID] = channel
+        }
+        connection.resolve(.success(control))
+    }
+
     // MARK: - Teardown
 
     private func failSession(_ sessionID: UUID, error: any Error) async {
@@ -870,12 +967,23 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
     ) async {
         guard connectionsBySession[connection.sessionID] === connection else { return }
         connectionsBySession.removeValue(forKey: connection.sessionID)
+        Self.connectionLog.notice(
+            "\(Self.tag(connection.sessionID), privacy: .public) closed peer=\(connection.peer.map { Self.tag($0.deviceID) } ?? "-", privacy: .public) \(connection.purpose.rawValue, privacy: .public) reason=\(String(describing: DisconnectReason(error: error)), privacy: .public) error=\(String(describing: error), privacy: .public)"
+        )
 
         if sendGoodbye, isCurrent(connection.epoch) {
             beginGoodbye(on: connection.nwConnection, reason: DisconnectReason(error: error))
         }
         connection.resolve(.failure(error))
         let queue = connection.cancel()
+
+        if let channel = connection.binaryChannel {
+            connection.binaryChannel = nil
+            if binaryChannels[channel.peerDeviceID] === channel {
+                binaryChannels.removeValue(forKey: channel.peerDeviceID)
+            }
+            await channel.close()
+        }
 
         if let peer = connection.peer, connectionsByDevice[peer.deviceID] === connection {
             connectionsByDevice.removeValue(forKey: peer.deviceID)
@@ -886,6 +994,14 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
             }
             if notify {
                 emit(.peerDisconnected(deviceID: peer.deviceID, reason: DisconnectReason(error: error), epoch: connection.epoch))
+            }
+            // Sin conexión de control, los streams binarios de ese peer pierden su
+            // identidad: se cierran con ella.
+            let binaries = connectionsBySession.values.filter {
+                $0.purpose == .byteStreams && $0.peer?.deviceID == peer.deviceID
+            }
+            for binary in binaries {
+                await fail(binary, error: error, notify: false)
             }
         }
 
@@ -918,6 +1034,11 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
         farewellTasks.removeValue(forKey: id)
     }
 
+    /// Prefijo corto de un identificador, suficiente para seguir una conexión en
+    /// los logs sin volcar UUIDs completos.
+    private nonisolated static func tag(_ id: UUID) -> String { String(id.uuidString.prefix(8)) }
+    private nonisolated static func tag(_ id: DeviceID) -> String { tag(id.rawValue) }
+
     // MARK: - Emisión de eventos
 
     private nonisolated func emit(_ event: TransportEvent) {
@@ -932,9 +1053,13 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
     /// Codifica un `Frame` a JSON y lo entrega como un mensaje delimitado por el
     /// framer de longitud. `async` que resuelve al completarse el envío.
     private static func sendFrame(_ frame: Frame, on nwConnection: NWConnection) async throws {
-        let data = try JSONEncoder().encode(frame)
+        try await sendMessage(try JSONEncoder().encode(frame), identifier: "frame", on: nwConnection)
+    }
+
+    /// Entrega un mensaje completo al framer de longitud.
+    private static func sendMessage(_ data: Data, identifier: String, on nwConnection: NWConnection) async throws {
         let message = NWProtocolFramer.Message(definition: LengthPrefixFramer.definition)
-        let context = NWConnection.ContentContext(identifier: "frame", metadata: [message])
+        let context = NWConnection.ContentContext(identifier: identifier, metadata: [message])
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
             nwConnection.send(
                 content: data,
@@ -951,59 +1076,59 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
         }
     }
 
-    // MARK: - Canal binario QUIC (capacidad BinaryStreamOpening)
+    // MARK: - Canal binario (capacidad BinaryStreamOpening)
 
-    /// Nombre de servicio Bonjour de un peer, derivado de su `deviceID` igual que
-    /// el propio. Permite construir su endpoint QUIC sin un browser UDP aparte.
-    private nonisolated func serviceName(for deviceID: DeviceID) -> String {
-        String(deviceID.description.prefix(8)).lowercased()
-    }
-
-    /// Abre (o reutiliza) un `QUICChannel` hacia un peer conectado y abre un stream.
+    /// Abre un stream hacia un peer conectado, por su conexión binaria dedicada.
     public func openByteStream(
         to deviceID: DeviceID,
         descriptor: ByteStreamDescriptor
-    ) async throws(TransportError) -> QUICByteStream {
-        guard connectionsByDevice[deviceID]?.peer != nil else {
+    ) async throws(TransportError) -> ByteStreamWriter {
+        guard let control = connectionsByDevice[deviceID]?.peer else {
             throw TransportError.notConnected
+        }
+        guard control.supports(.binaryStreams) else {
+            throw TransportError.connectionFailed(.binaryStreamsUnsupported)
         }
         let channel = try await binaryChannel(for: deviceID)
         return try await channel.openStreamMapped(descriptor)
     }
 
-    /// Crea (o reutiliza) el `QUICChannel` hacia un peer. El mismo canal sirve
-    /// ambos sentidos: sus streams entrantes (los que el peer nos abre) se
-    /// reenvían al flujo único `incomingByteStreams`.
-    private func binaryChannel(for deviceID: DeviceID) async throws(TransportError) -> QUICChannel {
+    /// Reutiliza el canal binario con un peer (lo haya abierto quien sea) o marca
+    /// su anuncio Bonjour para abrir uno nuevo.
+    private func binaryChannel(for deviceID: DeviceID) async throws(TransportError) -> BinaryChannel {
         if let existing = binaryChannels[deviceID] { return existing }
+        guard let token = activeEpoch, isCurrent(token) else { throw TransportError.transportStopped }
 
-        let endpoint = NWEndpoint.service(
-            name: serviceName(for: deviceID),
-            type: ProtocolInfo.quicServiceType,
-            domain: "local.",
-            interface: nil
-        )
-        let channel = QUICChannel(crypto: crypto, deviceID: self.deviceID)
-        binaryChannels[deviceID] = channel
-        do {
-            try await channel.connect(to: endpoint)
-        } catch {
-            binaryChannels.removeValue(forKey: deviceID)
-            await channel.close()
-            throw TransportError.connectionFailed(DisconnectReason(error: error))
+        let connection: Connection
+        if let pending = connectionsBySession.values.first(where: {
+            $0.isOutgoing && $0.purpose == .byteStreams && $0.expectedDeviceID == deviceID && $0.peer == nil
+        }) {
+            connection = pending
+        } else {
+            guard let endpointID = advertisements.first(where: { $0.value.deviceID == deviceID })?.key,
+                  let endpoint = endpoints[endpointID] else {
+                throw TransportError.peerNotDiscovered
+            }
+            guard connectionsBySession.count < 64 else {
+                throw TransportError.connectionFailed(.connectionFailed)
+            }
+            connection = register(
+                NWConnection(to: endpoint, using: makeParameters()),
+                epoch: token,
+                outgoing: true,
+                purpose: .byteStreams,
+                endpointID: endpointID,
+                expectedDeviceID: deviceID
+            )
         }
-        // Reenvía los streams que este peer nos abra al flujo único.
-        Task { [weak self] in
-            do {
-                for try await incoming in await channel.startIncoming() {
-                    self?.forwardIncomingByteStream(incoming)
-                }
-            } catch { /* canal cerrado */ }
+        _ = try await awaitHandshake(of: connection, epoch: token)
+        guard let channel = connection.binaryChannel else {
+            throw TransportError.connectionFailed(.connectionClosed)
         }
         return channel
     }
 
-    private nonisolated func forwardIncomingByteStream(_ incoming: QUICIncomingStream) {
+    private nonisolated func forwardIncomingByteStream(_ incoming: IncomingByteStream) {
         incomingByteStreamContinuation.yield(incoming)
     }
 
@@ -1019,9 +1144,13 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
         let isOutgoing: Bool
         let endpointID: TransportPeerID?
         let expectedDeviceID: DeviceID?
+        /// Para una entrante, se fija al recibir el hello del peer.
+        var purpose: ConnectionPurpose
 
         var peer: ConnectedPeer?
         var queue: SendQueue?
+        /// Solo en conexiones `.byteStreams`, tras el hello.
+        var binaryChannel: BinaryChannel?
         var helloTask: Task<Void, Never>?
         var timeoutTask: Task<Void, Never>?
         var waiters: [UUID: CheckedContinuation<ConnectedPeer, any Error>] = [:]
@@ -1030,12 +1159,14 @@ public actor NetworkTransport: Transport, BinaryStreamOpening {
             nwConnection: NWConnection,
             epoch: UInt64,
             outgoing: Bool,
+            purpose: ConnectionPurpose,
             endpointID: TransportPeerID?,
             expectedDeviceID: DeviceID?
         ) {
             self.nwConnection = nwConnection
             self.epoch = epoch
             self.isOutgoing = outgoing
+            self.purpose = purpose
             self.endpointID = endpointID
             self.expectedDeviceID = expectedDeviceID
         }

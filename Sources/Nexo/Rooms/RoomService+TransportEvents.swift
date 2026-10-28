@@ -10,7 +10,7 @@ import Foundation
 @NexoActor
 extension RoomService {
 
-    public func handle(_ event: TransportEvent) {
+    func handle(_ event: TransportEvent) {
         guard event.epoch == transport.epoch else { return }
         switch event {
         case .advertisementFound(let advertisement, _), .advertisementUpdated(let advertisement, _):
@@ -115,7 +115,7 @@ extension RoomService {
     func handlePeerDisconnected(deviceID: DeviceID, reason: DisconnectReason?) {
         connectedPeers.removeValue(forKey: deviceID)
         for (roomID, operation) in pendingJoins where operation.hostDeviceID == deviceID {
-            finishJoin(roomID, requestID: operation.id, result: .failure(RoomError.peerUnavailable))
+            finishJoin(roomID, requestID: operation.id, result: .failure(RoomError.connectionLost))
         }
         var isMemberOfAnyRoom = false
 
@@ -193,6 +193,7 @@ extension RoomService {
 
     func discardSession(_ roomID: RoomID, publishes: Bool = true) {
         if let session = sessions.removeValue(forKey: roomID) {
+            session.removeAllJoinRequests()
             transfers?.cancelAll(in: session)
             for member in session.remoteMembers {
                 cancelRecoveryIfUnused(for: member.deviceID)

@@ -53,11 +53,15 @@ public struct HelloBody: Codable, Sendable {
     /// Derivado público de la PSK local; debe coincidir con el del peer.
     public let pskHint: String?
     public let capabilities: [Capability]
+    /// Para qué abre el emisor esta conexión. `nil` equivale a `.control`, así
+    /// que un peer que no envía el campo sigue siendo compatible.
+    public let purpose: ConnectionPurpose?
 
     public init(
         deviceID: DeviceID,
         displayName: String,
         pskHint: String? = nil,
+        purpose: ConnectionPurpose = .control,
         protocolVersion: UInt8 = ProtocolInfo.currentVersion,
         minimumProtocolVersion: UInt8 = ProtocolInfo.minimumVersion,
         capabilities: Set<Capability> = ProtocolInfo.capabilities
@@ -67,8 +71,19 @@ public struct HelloBody: Codable, Sendable {
         self.deviceID = deviceID
         self.displayName = displayName
         self.pskHint = pskHint
+        self.purpose = purpose
         self.capabilities = Array(capabilities)
     }
+}
+
+// MARK: - ConnectionPurpose
+
+/// Uso de una conexión física. Un peer tiene una conexión de control (envelopes)
+/// y, si abre streams binarios, una segunda conexión dedicada a ellos para que
+/// el volumen binario nunca retrase el control ni el chat.
+public enum ConnectionPurpose: String, Codable, Sendable {
+    case control
+    case byteStreams
 }
 
 // MARK: - GoodbyeBody

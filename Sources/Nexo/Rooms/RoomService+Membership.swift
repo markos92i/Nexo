@@ -47,7 +47,9 @@ extension RoomService {
             roomToJoin: room,
             originalSessionInstanceID: sessions[room.id]?.instanceID
         )
-        scheduleJoinTimeout(for: room.id, requestID: requestID)
+        scheduleJoinTimeout(for: room.id, requestID: requestID, after: Limits.joinConnectTimeout)
+        Self.log.info("join \(room.id.description.prefix(8), privacy: .public): connecting to host")
+        publishRooms()
         do {
             return try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { continuation in
@@ -67,7 +69,7 @@ extension RoomService {
                             self?.completeJoinConnection(to: room, host: host, requestID: requestID)
                         } catch {
                             let failure: any Error = error is CancellationError
-                                ? CancellationError() : RoomError.transportFailure(DisconnectReason(error: error))
+                                ? CancellationError() : RoomError.hostUnreachable(DisconnectReason(error: error))
                             self?.finishJoin(room.id, requestID: requestID, result: .failure(failure))
                         }
                     }
@@ -417,6 +419,10 @@ extension RoomService {
         sessions[room.id] = session
         pendingJoins[room.id]?.sessionInstanceID = session.instanceID
         pendingJoins[room.id]?.connectionSessionID = host.connectionSessionID
+        // Conectados: ahora el plazo depende de que el host responda.
+        pendingJoins[room.id]?.timeoutTask?.cancel()
+        scheduleJoinTimeout(for: room.id, requestID: requestID, after: Limits.joinApprovalTimeout)
+        Self.log.info("join \(room.id.description.prefix(8), privacy: .public): connected, awaiting approval")
         activeRoomID = room.id
         publishRooms()
         sendJoinRequest(roomID: room.id, to: host.deviceID, requestID: requestID)
@@ -460,14 +466,18 @@ extension RoomService {
             && operation.sessionInstanceID != nil
     }
 
-    func scheduleJoinTimeout(for roomID: RoomID, requestID: UUID) {
+    func scheduleJoinTimeout(for roomID: RoomID, requestID: UUID, after delay: Duration = Limits.joinTimeout) {
         pendingJoins[roomID]?.timeoutTask = Task { @NexoActor [weak self] in
             do {
-                try await Task.sleep(for: Limits.joinTimeout)
+                try await Task.sleep(for: delay)
             } catch {
                 return
             }
-            self?.finishJoin(roomID, requestID: requestID, result: .failure(RoomError.joinTimedOut))
+            // Sin conexión todavía, el host es inalcanzable; conectados, no respondió.
+            let error: RoomError = self?.pendingJoins[roomID]?.roomToJoin != nil
+                ? .hostUnreachable(.handshakeTimedOut)
+                : .joinTimedOut
+            self?.finishJoin(roomID, requestID: requestID, result: .failure(error))
         }
     }
 
@@ -482,6 +492,11 @@ extension RoomService {
         pendingJoins.removeValue(forKey: roomID)
         operation.connectionTask?.cancel()
         operation.timeoutTask?.cancel()
+        if case .failure(let error) = result {
+            Self.log.notice(
+                "join \(roomID.description.prefix(8), privacy: .public) failed: \(String(describing: error), privacy: .public)"
+            )
+        }
 
         switch result {
         case .success(let session):

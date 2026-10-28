@@ -307,17 +307,33 @@ public final class Room: Identifiable {
         return true
     }
 
+    /// Avisa al servicio de cada solicitud que sale de la cola, sea cual sea el
+    /// motivo, para que publique `RoomNotice.joinRequestResolved`.
+    var onJoinRequestsRemoved: (@NexoActor ([RoomJoinRequest]) -> Void)?
+
     func removeJoinRequest(_ id: UUID) -> RoomJoinRequest? {
         guard let index = pendingJoinRequests.firstIndex(where: { $0.id == id }) else { return nil }
         let removed = pendingJoinRequests.remove(at: index)
         publishSnapshot()
+        onJoinRequestsRemoved?([removed])
         return removed
     }
 
     func removeJoinRequests(for deviceID: DeviceID) {
-        let before = pendingJoinRequests.count
+        let removed = pendingJoinRequests.filter { $0.deviceID == deviceID }
+        guard !removed.isEmpty else { return }
         pendingJoinRequests.removeAll { $0.deviceID == deviceID }
-        if pendingJoinRequests.count != before { publishSnapshot() }
+        publishSnapshot()
+        onJoinRequestsRemoved?(removed)
+    }
+
+    /// Vacía la cola al descartar la sala, avisando de cada solicitud.
+    func removeAllJoinRequests() {
+        let removed = pendingJoinRequests
+        guard !removed.isEmpty else { return }
+        pendingJoinRequests.removeAll()
+        publishSnapshot()
+        onJoinRequestsRemoved?(removed)
     }
 
     // MARK: - Actividades (internal)

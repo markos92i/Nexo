@@ -53,7 +53,7 @@ public final class PermissionsStatus {
 @NexoActor
 public final class PermissionsChecker {
 
-    private static let logger = Logger(subsystem: "com.nexo.permissions", category: "permissions")
+    private static let logger = Logger(subsystem: "com.nexo", category: "permissions")
 
     public let status = PermissionsStatus()
 

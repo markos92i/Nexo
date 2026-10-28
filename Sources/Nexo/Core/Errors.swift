@@ -36,8 +36,14 @@ public enum RoomError: Error, Sendable, Equatable {
     case notHost
     case featureUnavailable(RoomFeatures)
     case activityUnsupported(ActivityKind)
+    /// El host ya no se anuncia o su anuncio no coincide con la sala.
     case peerUnavailable
+    /// No se pudo abrir la conexión con el host.
+    case hostUnreachable(DisconnectReason)
+    /// La conexión con el host se cortó mientras se esperaba su respuesta.
+    case connectionLost
     case joinRejected(DisconnectReason)
+    /// El host no respondió a tiempo a la solicitud de entrada.
     case joinTimedOut
     case activityNotFound
     case activityAlreadyRunning

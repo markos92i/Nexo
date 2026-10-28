@@ -6,8 +6,23 @@ import Foundation
 /// globales de la app (p. ej. una bandeja de solicitudes o invitaciones).
 public enum RoomNotice: Sendable {
     case joinRequest(JoinRequestNotice)
+    /// La solicitud salió de la cola: se respondió (en esta u otra pantalla), el
+    /// invitado la retiró, se desconectó o la sala se cerró. La UI que la
+    /// mostraba debe retirarla.
+    case joinRequestResolved(JoinRequestNotice)
     case activityInvitation(ActivityInvitationNotice)
     case roomClosed(RoomClosedNotice)
+}
+
+extension RoomNotice {
+    /// Sala a la que se refiere el aviso.
+    public var roomID: RoomID {
+        switch self {
+        case .joinRequest(let notice), .joinRequestResolved(let notice): notice.roomID
+        case .activityInvitation(let notice): notice.roomID
+        case .roomClosed(let notice): notice.roomID
+        }
+    }
 }
 
 // MARK: - Payloads
