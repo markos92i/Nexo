@@ -221,6 +221,17 @@ Declara solo el tipo de tu `ServiceType` y el de la comprobación de permisos:
 
 ## Si venías de una versión anterior de este rewrite
 
+- **`NexoRuntime` y `ActivityModel`**: si tu app había escrito su propio gestor
+  (arranque, fase de escena, tiempo extra en segundo plano, identidad, montaje
+  de la pila, `bindTransfers`, retener adjuntos visibles) o un envoltorio de
+  `GenericActivity` para el hilo principal, Nexo ya los trae. Sustitúyelos.
+- **Construcción síncrona**: `LocalIdentity.loadOrCreate`, `RoomService(...)`,
+  `FileTransferService()`, `PermissionsChecker()`, `ActivityRegistry()` e
+  `InMemoryMessageStore()` ya no exigen `await`. Si montabas la pila en un
+  factory `async` con una pantalla de carga, puedes hacerlo en un `init`
+  normal. Si el Keychain falla, no arranques la red y reintenta más tarde; un
+  valor guardado corrupto se sustituye solo. `LocalIdentity.temporary(displayName:)`
+  es para previews y tests. `MessageStore` ahora refina `Sendable`.
 - **Tipo Bonjour**: `ProtocolInfo.serviceType` y `ProtocolInfo.quicServiceType` ya
   no existen. Pasa `service: ServiceType("tu-app")` a `NetworkTransport` y deja en
   el Info.plist solo `_tu-app._tcp` y `_nexo-probe._tcp` (quita `_nexo._tcp` y

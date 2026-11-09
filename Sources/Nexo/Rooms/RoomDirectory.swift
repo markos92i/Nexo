@@ -64,6 +64,27 @@ struct RoomDirectory {
         advertisements.values.first { $0.deviceID == deviceID }
     }
 
+    func advertisement(forEndpoint endpointID: TransportPeerID) -> PeerAdvertisement? {
+        advertisements[endpointID]
+    }
+
+    /// Salas disponibles para unirse, en orden estable, sin las ya unidas.
+    func availableRooms(isJoined: (RoomID) -> Bool) -> [DiscoveredRoom] {
+        rooms.values
+            .filter { !isJoined($0.id) }
+            .sorted { lhs, rhs in
+                if lhs.name == rhs.name { return lhs.id.description < rhs.id.description }
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+            }
+    }
+
+    /// Salas que ofrecen la actividad dada. Lo que usa el lobby de un juego para
+    /// listar partidas sin pasar por el chat.
+    func availableRooms(for kind: ActivityKind, isJoined: (RoomID) -> Bool) -> [DiscoveredRoom] {
+        availableRooms(isJoined: isJoined)
+            .filter { $0.activityKind == kind && $0.features.hasActivities }
+    }
+
     private static func isValid(_ descriptor: RoomDescriptor, hostDeviceID: DeviceID) -> Bool {
         descriptor.hostDeviceID == hostDeviceID
             && descriptor.memberCount > 0

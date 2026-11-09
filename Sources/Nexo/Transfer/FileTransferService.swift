@@ -97,7 +97,7 @@ public final class FileTransferService: RoomTransferHandling {
     private var lastFileValidation: ContinuousClock.Instant?
     private var isValidatingFiles = false
 
-    public init() {}
+    public nonisolated init() {}
 
     isolated deinit {
         cancelEverythingAndReleaseStorage()

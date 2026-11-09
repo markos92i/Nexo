@@ -1,16 +1,21 @@
 # Arquitectura de comunicación
 
-Nexo se organiza en cuatro capas con dependencias estrictamente descendentes.
-Cada capa conoce solo el contrato de la de abajo.
+Nexo se organiza en capas con dependencias descendentes: cada una conoce solo
+las de debajo. Cada carpeta de `Sources/Nexo` es una capa y guarda junto a su
+código los modelos que viajan por ella.
 
 ```
-Actividades   Activity, GenericActivity<Message>, ActivityRegistry
-   │          (el consumidor define juegos aquí; payload opaco hacia abajo)
-Salas         RoomService (fachada) + colaboradores; Room, RoomChat, RoomOutbox
-   │          FileTransferService, RoomsModel (copia observable para SwiftUI)
-Protocolo     Envelope, ControlMessage, modelos Codable, errores tipados
-Transporte    Transport (protocolo) → NetworkTransport; Bonjour, TCP, TLS-PSK
+Runtime       RoomsModel (copia observable para SwiftUI)
+Servicios     Chat/ (RoomChat), Activities/ (Activity, GenericActivity),
+   │          Transfer/ (FileTransferService)
+Salas         Rooms/: RoomService + extensiones, Room, RoomOutbox, Envelope,
+   │          ControlMessage, membresía y directorio
+Transporte    Transport/: contrato, NetworkTransport, framer, canal binario
+Base          Core/ (DeviceID, NexoActor, errores, límites), Identity/
 ```
+
+Excepción conocida: el transporte todavía recibe `Envelope`, que es de la capa de
+salas, para decidir prioridades y sustituciones en su cola.
 
 `RoomService` es el único lector de `Transport.events`: empieza a consumirlo en su
 init. Ese flujo no tiene límite de búfer, porque perder un `peerConnected` o un

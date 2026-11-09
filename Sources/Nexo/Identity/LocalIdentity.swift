@@ -12,25 +12,35 @@ import Security
 @NexoActor
 public final class LocalIdentity {
 
-    public let deviceID: DeviceID
+    public nonisolated let deviceID: DeviceID
     public var displayName: String
     /// Token de avatar opaco (clave de catálogo o miniatura codificada) publicado
     /// a los peers junto al nombre visible.
     public var avatar: String?
 
-    init(deviceID: DeviceID, displayName: String, avatar: String? = nil) {
+    nonisolated init(deviceID: DeviceID, displayName: String, avatar: String? = nil) {
         self.deviceID = deviceID
         self.displayName = displayName
         self.avatar = avatar
     }
 
-    /// Genera o recupera el `DeviceID` persistido en Keychain.
-    public static func loadOrCreate(
+    /// Genera o recupera el `DeviceID` persistido en Keychain. Es síncrono (una
+    /// lectura de Keychain), así que la app puede montar la pila en su init.
+    public nonisolated static func loadOrCreate(
         displayName: String,
         avatar: String? = nil
     ) throws(IdentityError) -> LocalIdentity {
         let deviceID = try DeviceIDStore.loadOrCreate()
         return LocalIdentity(deviceID: deviceID, displayName: displayName, avatar: avatar)
+    }
+
+    /// Identidad válida solo para esta ejecución, sin tocar Keychain.
+    ///
+    /// Para previews y tests. No la uses para salir a la red cuando
+    /// `loadOrCreate` falla: los demás verían un dispositivo distinto en cada
+    /// arranque. Lo correcto es no arrancar el transporte y reintentar.
+    public nonisolated static func temporary(displayName: String, avatar: String? = nil) -> LocalIdentity {
+        LocalIdentity(deviceID: DeviceID(), displayName: displayName, avatar: avatar)
     }
 
     public func member(role: RoomRole) -> RoomMember {
@@ -53,8 +63,13 @@ enum DeviceIDStore {
     private static let account = "default"
 
     static func loadOrCreate() throws(IdentityError) -> DeviceID {
-        if let existing = try load() {
-            return existing
+        do {
+            if let existing = try load() {
+                return existing
+            }
+        } catch .invalidStoredData {
+            // Waiting will never fix a corrupt value: replace it once, and the
+            // new ID is permanent from then on.
         }
         let created = DeviceID()
         try store(created)

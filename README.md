@@ -67,6 +67,41 @@ Añade Nexo como paquete Swift local y enlaza el producto `Nexo` a tu target.
 
 ## Puesta en marcha
 
+Con SwiftUI, `NexoRuntime` monta toda la pila y decide cuándo está encendida la
+red. Construirlo no tiene efectos; la red funciona mientras una tarea esté dentro
+de `run()`:
+
+```swift
+@main
+struct MiApp: App {
+    @Environment(\.scenePhase) private var phase
+    @State private var nexo = NexoRuntime<RoomSnapshot>(
+        appSecret: "mi-secreto-de-app",
+        service: ServiceType("mi-app"),                 // → _mi-app._tcp
+        displayName: UIDevice.current.name,
+        registerActivities: { rooms in /* rooms.registerActivity(...) */ },
+        makeRoomState: { snapshot, _, _ in snapshot }
+    )
+
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+                .environment(nexo)
+                .task { await nexo.run() }          // cancelar = cerrar salas
+        }
+        .onChange(of: phase) { nexo.isInBackground = $1 == .background }
+    }
+}
+```
+
+`nexo.state` dice si el multijugador está en marcha o por qué no
+(`.unavailable(.identity)` si el Keychain no da la identidad permanente);
+`nexo.rooms`, `nexo.transfers` y `nexo.model` solo existen mientras está en
+marcha. Para usar una actividad desde un view model, envuélvela en
+`ActivityModel`.
+
+Sin SwiftUI, o para controlar cada pieza, la pila se monta a mano:
+
 ```swift
 import Nexo
 

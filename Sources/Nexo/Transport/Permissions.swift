@@ -31,6 +31,8 @@ public final class PermissionsStatus {
     public private(set) var localNetwork: PermissionState = .unknown
     public private(set) var lastChecked: Date?
 
+    nonisolated init() {}
+
     public var isFullyGranted: Bool { localNetwork == .granted }
     public var hasCriticalDenial: Bool {
         localNetwork == .denied || localNetwork == .restricted
@@ -63,7 +65,7 @@ public final class PermissionsChecker {
     private var checkTask: Task<Void, Never>?
     private var monitorTask: Task<Void, Never>?
 
-    public init() {}
+    public nonisolated init() {}
 
     deinit {
         checkTask?.cancel()

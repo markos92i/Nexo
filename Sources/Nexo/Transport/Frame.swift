@@ -1,4 +1,5 @@
 import Foundation
+import Network
 
 // MARK: - Frame
 
@@ -93,5 +94,76 @@ public struct GoodbyeBody: Codable, Sendable, Equatable {
 
     public init(reason: DisconnectReason) {
         self.reason = reason
+    }
+}
+
+// MARK: - LengthPrefixFramer
+
+/// Framer de longitud: delimita cada `Frame` JSON con un header UInt32 big-endian
+/// seguido del payload. Así el stream TCP recupera mensajes completos aunque el
+/// socket entregue los bytes fragmentados o agrupados.
+final class LengthPrefixFramer: NWProtocolFramerImplementation {
+
+    static let definition = NWProtocolFramer.Definition(implementation: LengthPrefixFramer.self)
+    static var label: String { "NexoLengthPrefix" }
+
+    private static let headerSize = 4
+    /// Cota de seguridad: un frame nunca debería superar el envelope máximo más
+    /// el overhead de control y el header.
+    private static let maximumFrameBytes = Limits.maximumEnvelopeBytes + 64 * 1024
+
+    init(framer: NWProtocolFramer.Instance) {}
+
+    func start(framer: NWProtocolFramer.Instance) -> NWProtocolFramer.StartResult { .ready }
+    func wakeup(framer: NWProtocolFramer.Instance) {}
+    func stop(framer: NWProtocolFramer.Instance) -> Bool { true }
+    func cleanup(framer: NWProtocolFramer.Instance) {}
+
+    /// Serializa: header de 4 bytes big-endian + payload.
+    func handleOutput(
+        framer: NWProtocolFramer.Instance,
+        message: NWProtocolFramer.Message,
+        messageLength: Int,
+        isComplete: Bool
+    ) {
+        var header = UInt32(messageLength).bigEndian
+        let headerData = withUnsafeBytes(of: &header) { Data($0) }
+        framer.writeOutput(data: headerData)
+        do {
+            try framer.writeOutputNoCopy(length: messageLength)
+        } catch {
+            // El framer cerró; nada que delimitar.
+        }
+    }
+
+    /// Parsea: lee el header, luego el payload de esa longitud, y entrega un mensaje.
+    func handleInput(framer: NWProtocolFramer.Instance) -> Int {
+        while true {
+            var payloadLength = 0
+            let parsedHeader = framer.parseInput(
+                minimumIncompleteLength: Self.headerSize,
+                maximumLength: Self.headerSize
+            ) { buffer, _ in
+                guard let buffer, buffer.count >= Self.headerSize else { return 0 }
+                var value: UInt32 = 0
+                withUnsafeMutableBytes(of: &value) { raw in
+                    raw.copyBytes(from: buffer.prefix(Self.headerSize))
+                }
+                payloadLength = Int(UInt32(bigEndian: value))
+                return Self.headerSize
+            }
+
+            guard parsedHeader else { return Self.headerSize }
+
+            // Protección contra longitudes absurdas: fuerza cierre descartando.
+            guard payloadLength >= 0, payloadLength <= Self.maximumFrameBytes else {
+                return 0
+            }
+
+            let message = NWProtocolFramer.Message(definition: Self.definition)
+            if !framer.deliverInputNoCopy(length: payloadLength, message: message, isComplete: true) {
+                return 0
+            }
+        }
     }
 }

@@ -119,7 +119,8 @@ public final class RoomService {
 
     // MARK: - Estado interno
 
-    let discovery = DiscoveryService()
+    /// Anuncios y salas descubiertas por Bonjour y por `roomDirectory`.
+    var discovery = RoomDirectory()
     var connectedPeers: [DeviceID: ConnectedPeer] = [:]
 
     struct PendingJoin {
@@ -320,7 +321,10 @@ public final class RoomService {
 
     // MARK: - Init
 
-    public init(
+    /// Síncrono y `nonisolated`, para que la app pueda montar la pila en su init.
+    /// Empieza a leer los eventos del transporte en cuanto entra en `NexoActor`;
+    /// el flujo no descarta nada, así que no se pierde ninguno entretanto.
+    public nonisolated init(
         transport: any Transport,
         identity: LocalIdentity,
         registry: ActivityRegistry? = nil,
@@ -333,8 +337,13 @@ public final class RoomService {
         self.registry = registry ?? ActivityRegistry()
         self.store = store ?? InMemoryMessageStore()
 
-        // El servicio es el único lector de los eventos del transporte: la app no
-        // tiene que reenviarlos, y no puede olvidarse de hacerlo.
+        Task { @NexoActor [weak self] in self?.startListening() }
+    }
+
+    /// El servicio es el único lector de los eventos del transporte: la app no
+    /// tiene que reenviarlos, y no puede olvidarse de hacerlo.
+    private func startListening() {
+        guard eventTask == nil else { return }
         let events = transport.events
         eventTask = Task { @NexoActor [weak self] in
             for await event in events {

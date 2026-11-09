@@ -73,6 +73,10 @@ Nexo genera y persiste un `DeviceID` único por instalación. El cifrado es PSK:
 un secreto de app (constante tuya) y, si quieres aislar salas, un código de sala.
 
 ```swift
+// El DeviceID debe ser permanente. Si el Keychain falla, no arranques la red:
+// muestra que el multijugador no está disponible y vuelve a intentarlo después
+// (al volver a primer plano, o con un botón). Un valor guardado corrupto se
+// sustituye solo, una vez.
 let identity = try LocalIdentity.loadOrCreate(displayName: deviceName)
 
 // Canal común de app (todas las salas comparten PSK):
@@ -84,11 +88,17 @@ let crypto = SessionCrypto(appSecret: "mi-secreto-de-app")
 let transport = NetworkTransport(
     crypto: crypto,
     deviceID: identity.deviceID,
-    displayName: identity.displayName,
+    displayName: deviceName,
     service: ServiceType("mi-app")   // anuncia y busca _mi-app._tcp
 )
 let rooms = RoomService(transport: transport, identity: identity)
 ```
+
+Todo esto es síncrono y se puede llamar desde cualquier actor, incluido el
+`init` de tu `App` o de un objeto `@MainActor`: no hace falta una pantalla de
+carga para montar la pila. Lo único que exige `NexoActor` es lo que se hace
+después, como `registerActivity` o `bindTransfers`. `LocalIdentity.temporary`
+existe para previews y tests; no lo uses para salir a la red.
 
 `ServiceType` admite de 1 a 15 caracteres: minúsculas ASCII, dígitos y guiones,
 sin guion al principio ni al final (un nombre inválido hace saltar una
@@ -139,6 +149,43 @@ transport.start(advertising: true, browsing: true)
 ---
 
 ## Estado en SwiftUI
+
+### NexoRuntime
+
+La forma recomendada para una app SwiftUI (ver el ejemplo del README). Reúne en
+un solo objeto `@Observable`:
+
+- **Vida:** `run()` mantiene la red mientras viva la tarea que lo llama (varias
+  ventanas pueden llamarlo); al cancelarse, cierra las salas. La app solo informa
+  de hechos: `isInBackground` y `retry()`.
+- **Estado:** `state` (`.starting`, `.online`, `.reconnecting`, `.suspended`,
+  `.unavailable(reason)`) y `blockingUnavailableReason` para pantallas de
+  multijugador.
+- **Segundo plano:** en iOS, con salas abiertas, pide tiempo extra al sistema y
+  después suspende; en macOS no suspende y evita App Nap mientras haya salas.
+- **Identidad:** si el Keychain no da la identidad permanente, no arranca la red
+  y reintenta con cada hecho nuevo. En DEBUG, `-NexoSimulateIdentityFailure`
+  hace fallar la primera lectura.
+- **Pila:** `rooms`, `transfers` y `model` (un `RoomsModel`) existen solo
+  mientras está en marcha; `sessionID` cambia con cada sesión nueva.
+- **Previews:** `NexoRuntime.preview(makeRoomState:)` usa un transporte inerte.
+
+### ActivityModel
+
+Envuelve una `GenericActivity` para usarla desde el hilo principal: copia el
+descriptor, entrega los eventos ahí y envía sin `await`.
+
+```swift
+let model = await ActivityModel(activity) { message in message.coalescingKey }
+model.start { model, event in /* ... */ }
+model.send(.move(row: 0, col: 1, value: 5))              // a todos
+model.send(.board(board), to: .member(rivalDeviceID))   // reemplazable si tiene clave
+```
+
+Los mensajes con clave son reemplazables: si dos esperan a salir hacia el mismo
+destino, solo sale el último.
+
+### RoomsModel
 
 `RoomsModel` es opcional: una copia `@MainActor @Observable` del estado de
 `RoomService`, lista para usar en vistas. Expone `lifecycle`,
