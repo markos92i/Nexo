@@ -8,7 +8,7 @@ import Foundation
 /// define y decodifica sus propios mensajes. Añadir un juego nuevo nunca toca una
 /// capa inferior.
 @NexoActor
-public protocol Activity: AnyObject {
+public protocol Activity: AnyObject, Sendable {
 
     var descriptor: ActivityDescriptor { get }
 
