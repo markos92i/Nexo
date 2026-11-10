@@ -287,7 +287,7 @@ public final class NexoRuntime<RoomState: Sendable> {
             return
         }
 
-        if identity == nil { identity = loadIdentity() }
+        if identity == nil { identity = await loadIdentityOffMain() }
         guard let identity else {
             state = .unavailable(.identity)
             return
@@ -350,14 +350,34 @@ public final class NexoRuntime<RoomState: Sendable> {
         return stack
     }
 
+    /// Lectura síncrona del init: así `localDeviceID` existe desde el primer
+    /// momento (los juegos en solitario lo usan). Es una sola lectura de Keychain.
     private func loadIdentity() -> LocalIdentity? {
-        if simulatesIdentityFailure {
-            simulatesIdentityFailure = false
-            runtimeLog.error("Device identity unavailable: simulated failure")
-            return nil
-        }
+        if consumeSimulatedFailure() { return nil }
+        return Self.readIdentity(displayName: localDisplayName, avatar: avatar)
+    }
+
+    /// Los reintentos leen el Keychain fuera del hilo principal.
+    private func loadIdentityOffMain() async -> LocalIdentity? {
+        if consumeSimulatedFailure() { return nil }
+        return await Self.readIdentityConcurrently(displayName: localDisplayName, avatar: avatar)
+    }
+
+    private func consumeSimulatedFailure() -> Bool {
+        guard simulatesIdentityFailure else { return false }
+        simulatesIdentityFailure = false
+        runtimeLog.error("Device identity unavailable: simulated failure")
+        return true
+    }
+
+    @concurrent
+    private nonisolated static func readIdentityConcurrently(displayName: String, avatar: String?) async -> LocalIdentity? {
+        readIdentity(displayName: displayName, avatar: avatar)
+    }
+
+    private nonisolated static func readIdentity(displayName: String, avatar: String?) -> LocalIdentity? {
         do {
-            return try LocalIdentity.loadOrCreate(displayName: localDisplayName, avatar: avatar)
+            return try LocalIdentity.loadOrCreate(displayName: displayName, avatar: avatar)
         } catch {
             runtimeLog.error("Device identity unavailable: \(String(describing: error), privacy: .public)")
             return nil
@@ -456,6 +476,7 @@ public final class NexoRuntime<RoomState: Sendable> {
         private let monitorsPermissions: Bool
         private let onPermissionChange: @MainActor @Sendable (PermissionState) -> Void
         private var noticeTask: Task<Void, Never>?
+        private var retentionTask: Task<Void, Never>?
         private(set) var isTransportRunning = false
 
         init(
@@ -478,9 +499,14 @@ public final class NexoRuntime<RoomState: Sendable> {
             self.onPermissionChange = onPermissionChange
             self.model = RoomsModel(service: rooms, makeState: makeRoomState)
             model.onTransportEvent = onTransportEvent
-            // Los adjuntos que el chat aún enseña no se pueden borrar al podar.
-            model.onRoomsChanged = {
-                Task { @NexoActor in await Self.retainVisibleTransfers(rooms: rooms, transfers: transfers) }
+            // Los adjuntos que el chat aún enseña no se pueden borrar al podar. Una
+            // ráfaga de cambios se agrupa en una sola pasada.
+            let (changes, changed) = AsyncStream.makeStream(of: Void.self, bufferingPolicy: .bufferingNewest(1))
+            model.onRoomsChanged = { changed.yield() }
+            retentionTask = Task { @NexoActor in
+                for await _ in changes {
+                    await Self.retainVisibleTransfers(rooms: rooms, transfers: transfers)
+                }
             }
             let notices = model.notices
             noticeTask = Task {
@@ -490,6 +516,7 @@ public final class NexoRuntime<RoomState: Sendable> {
 
         isolated deinit {
             noticeTask?.cancel()
+            retentionTask?.cancel()
         }
 
         /// Registra juegos y servicios. Termina antes del primer `start()`.
@@ -530,6 +557,7 @@ public final class NexoRuntime<RoomState: Sendable> {
         func close() async {
             isTransportRunning = false
             noticeTask?.cancel()
+            retentionTask?.cancel()
             model.clearPeers()
             await Self.close(transport: transport, rooms: rooms, permissions: permissions)
         }

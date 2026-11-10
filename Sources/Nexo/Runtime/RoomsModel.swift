@@ -118,14 +118,16 @@ public final class RoomsModel<RoomState: Sendable> {
 
         tasks.append(Task { @NexoActor [weak self] in
             for await notice in service.notices {
-                // Captura el estado en el mismo paso del actor que el aviso.
+                guard let self else { return }
+                // Parte del estado ya derivado para no rehacerlo entero.
+                let previous = await self.roomStates[notice.roomID]
+                // Captura el estado en un solo paso del actor, sin suspensiones.
                 let rooms = service.currentRoomsSnapshot()
                 let session = service.session(notice.roomID)
                 let room = session.map { session in
                     let snapshot = session.snapshot()
-                    return (makeState(snapshot, nil), snapshot.revision, session.instanceID)
+                    return (makeState(snapshot, previous), snapshot.revision, session.instanceID)
                 }
-                guard let self else { return }
                 await self.deliver(notice, rooms: rooms, room: room)
             }
         })
