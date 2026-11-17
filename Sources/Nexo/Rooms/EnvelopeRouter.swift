@@ -205,6 +205,25 @@ extension RoomService {
         case .chatHistory(let payload):
             handleChatHistory(payload, from: peer, roomID: envelope.roomID)
 
+        // MARK: Perfil
+
+        case .profileChanged(let member):
+            // Solo el propio miembro cambia su perfil; `DeviceID` es autodeclarado,
+            // pero coincide con la conexión que lo envía.
+            guard let session = sessions[envelope.roomID],
+                  member.deviceID == peer.deviceID else { return }
+            refreshProfile(
+                of: peer.deviceID,
+                displayName: member.displayName,
+                avatar: member.avatar,
+                photoDigest: member.photoDigest,
+                in: session
+            )
+
+        case .photoRequest(let digest):
+            guard let session = sessions[envelope.roomID] else { return }
+            servePhoto(digest, to: peer.deviceID, in: session)
+
         case .roomClosed(let payload):
             guard let session = sessions[payload.roomID],
                   session.descriptor.hostDeviceID == peer.deviceID else { return }

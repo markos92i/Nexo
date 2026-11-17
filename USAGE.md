@@ -288,6 +288,34 @@ func accept(_ notice: JoinRequestNotice) {
 cualquier motivo: la respondiste aquí o en otra pantalla, el invitado canceló o se
 desconectó, o la sala se cerró. Úsalo para retirar el aviso.
 
+### Perfil y foto
+
+Cada `RoomMember` lleva el nombre, un `avatar` pequeño (clave de catálogo o
+miniatura, como mucho 24 KB) y, si tiene foto, su `photoDigest` (SHA-256). La
+foto completa no viaja en la lista de miembros: se pide cuando hace falta.
+
+```swift
+// Al arrancar y cada vez que cambie. Nexo calcula el hash fuera del hilo principal
+// y lee el archivo cada vez que alguien pide la foto, así que debe seguir ahí.
+p2p.setAvatar(thumbnailToken, photo: photoFileURL)
+p2p.setDisplayName(nickname)
+
+// Para pintar la foto grande de otro miembro:
+if let url = await p2p.memberPhoto(member, in: roomID) { show(url) }
+```
+
+- Los cambios llegan a las salas en las que ya estás: el host reescribe su
+  entrada y un invitado se lo pide a su host, que manda la lista nueva a todos.
+  Quien vuelve a una sala tras desconectarse trae su perfil en la re-entrada.
+- `memberPhoto` devuelve la copia en caché si la hay. Si no, se la pide al dueño
+  o, sin conexión directa con él, al host, que la descarga y la reenvía. Varias
+  vistas que piden la misma foto comparten una descarga. Devuelve `nil` sin foto,
+  sin conexión o pasados 15 s.
+- La foto llega por un stream binario que no sale en `incomingByteStreams`. Se
+  comprueba el SHA-256 y se guarda en `Caches/nexo-photos-v1`, con unos 20 MB
+  como máximo; se borran primero las usadas hace más tiempo.
+- Solo se sirven fotos de miembros actuales de la sala por la que se piden.
+
 ---
 
 ## Actividades (juegos)
@@ -423,6 +451,8 @@ cierre está en la línea `closed … reason=` de `connection`.
 | Parámetro | Límite |
 |-----------|--------|
 | Mensaje máximo | 512 KB |
+| Token de avatar (`maximumAvatarTokenBytes`) | 24 KB |
+| Foto de perfil (`maximumPhotoBytes`) | 2 MB |
 | Archivo máximo | 25 MB |
 | Chunk de transferencia | 32 KB |
 | Frame de stream binario | 64 KB |

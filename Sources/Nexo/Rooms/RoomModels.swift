@@ -79,8 +79,11 @@ public struct RoomMember: Codable, Hashable, Sendable, Identifiable {
     public let displayName: String
     public let role: RoomRole
     /// Token de avatar opaco elegido por el peer (clave de catálogo o miniatura
-    /// codificada). Ausente en peers anteriores a este campo.
+    /// codificada). Como mucho `Limits.maximumAvatarTokenBytes`.
     public let avatar: String?
+    /// SHA-256 en hexadecimal de la foto de perfil completa, que se pide bajo
+    /// demanda con `RoomService.memberPhoto(_:in:)`.
+    public let photoDigest: String?
 
     public var id: DeviceID { deviceID }
 
@@ -88,15 +91,35 @@ public struct RoomMember: Codable, Hashable, Sendable, Identifiable {
         deviceID: DeviceID,
         displayName: String,
         role: RoomRole,
-        avatar: String? = nil
+        avatar: String? = nil,
+        photoDigest: String? = nil
     ) {
         self.deviceID = deviceID
         self.displayName = displayName
         self.role = role
         self.avatar = avatar
+        self.photoDigest = photoDigest
     }
 
     public var isHost: Bool { role == .host }
+
+    /// Same member with another role, keeping the profile.
+    func with(role: RoomRole) -> RoomMember {
+        RoomMember(deviceID: deviceID, displayName: displayName, role: role, avatar: avatar, photoDigest: photoDigest)
+    }
+
+    /// Drops profile fields that break the wire limits. A peer with a bad
+    /// avatar still joins, just without it.
+    static func validAvatar(_ token: String?) -> String? {
+        guard let token, token.utf8.count <= Limits.maximumAvatarTokenBytes else { return nil }
+        return token
+    }
+
+    static func validPhotoDigest(_ digest: String?) -> String? {
+        guard let digest, digest.utf8.count == 64,
+              digest.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { return nil }
+        return digest
+    }
 }
 
 // MARK: - RoomDescriptor
@@ -201,6 +224,7 @@ public struct RoomJoinRequest: Identifiable, Sendable, Equatable {
     public let deviceID: DeviceID
     public let displayName: String
     public let avatar: String?
+    public let photoDigest: String?
     public let receivedAt: Date
     public let requestID: UUID?
     public let connectionSessionID: UUID?
@@ -211,6 +235,7 @@ public struct RoomJoinRequest: Identifiable, Sendable, Equatable {
         deviceID: DeviceID,
         displayName: String,
         avatar: String? = nil,
+        photoDigest: String? = nil,
         receivedAt: Date = Date(),
         requestID: UUID? = nil,
         connectionSessionID: UUID? = nil
@@ -220,6 +245,7 @@ public struct RoomJoinRequest: Identifiable, Sendable, Equatable {
         self.deviceID = deviceID
         self.displayName = displayName
         self.avatar = avatar
+        self.photoDigest = photoDigest
         self.receivedAt = receivedAt
         self.requestID = requestID
         self.connectionSessionID = connectionSessionID

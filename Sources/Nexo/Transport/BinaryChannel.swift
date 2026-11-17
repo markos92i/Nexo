@@ -261,6 +261,10 @@ actor BinaryChannel {
 /// archivos a propósito, así que la misma API puede llevar estado de juego, media
 /// o datos.
 public struct ByteStreamDescriptor: Codable, Sendable, Equatable, Identifiable {
+    /// Reservado para fotos de perfil, con el digest en `name`. Nexo consume
+    /// estos streams y nunca llegan a `incomingByteStreams`.
+    public static let photoMimeType = "application/vnd.nexo.photo"
+
     public let id: UUID
     public let roomID: RoomID
     public let mimeType: String

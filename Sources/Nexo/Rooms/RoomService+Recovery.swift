@@ -357,14 +357,7 @@ extension RoomService {
 
         let members = session.members
             .filter { $0.deviceID != failedHostDeviceID }
-            .map { member in
-            RoomMember(
-                deviceID: member.deviceID,
-                displayName: member.displayName,
-                role: member.deviceID == identity.deviceID ? .host : .guest,
-                avatar: member.avatar
-            )
-        }
+            .map { $0.with(role: $0.deviceID == identity.deviceID ? .host : .guest) }
 
         let migratedIDs = prepareActivityMigration(after: failedHostDeviceID, in: session)
         var descriptor = session.descriptor

@@ -81,6 +81,9 @@ public final class NexoRuntime<RoomState: Sendable> {
 
     @ObservationIgnored private var identity: LocalIdentity?
     @ObservationIgnored private var avatar: String?
+    @ObservationIgnored private var photo: URL?
+    @ObservationIgnored private var photoDigest: String?
+    @ObservationIgnored private var profileTask: Task<Void, Never>?
     @ObservationIgnored private var runners = 0
     @ObservationIgnored private var hasNetworkFailed = false
     @ObservationIgnored private var hasGraceExpired = false
@@ -242,14 +245,32 @@ public final class NexoRuntime<RoomState: Sendable> {
     public func setDisplayName(_ name: String) {
         guard name != localDisplayName else { return }
         localDisplayName = name
-        guard let stack else { return }
-        Task { await stack.setDisplayName(name) }
+        Task { await applyProfile(republishes: true) }
     }
 
-    public func setAvatar(_ avatar: String?) {
+    /// - Parameters:
+    ///   - avatar: token que viaja en cada lista de miembros (clave de catálogo o
+    ///     miniatura); como mucho `Limits.maximumAvatarTokenBytes`.
+    ///   - photo: foto completa que se sirve a quien la pida. Nexo la lee cada vez
+    ///     que la envía, así que el archivo debe seguir ahí.
+    public func setAvatar(_ avatar: String?, photo: URL?) {
         self.avatar = avatar
-        guard let stack else { return }
-        Task { await stack.setAvatar(avatar) }
+        self.photo = photo
+        profileTask?.cancel()
+        profileTask = Task {
+            let digest: String? = if let photo { await PhotoCache.digest(ofFileAt: photo) } else { nil }
+            // A newer call replaced this one while hashing.
+            guard !Task.isCancelled else { return }
+            photoDigest = digest
+            await applyProfile(republishes: false)
+        }
+    }
+
+    /// Archivo local con la foto completa de un miembro, descargándola si hace
+    /// falta. `nil` sin foto o si no se pudo obtener: queda la miniatura.
+    public func memberPhoto(_ member: RoomMember, in roomID: RoomID) async -> URL? {
+        guard let rooms else { return nil }
+        return await rooms.memberPhoto(member, in: roomID)
     }
 
     public func republishAdvertisement() {
@@ -265,6 +286,37 @@ public final class NexoRuntime<RoomState: Sendable> {
     public func leaveRoom(_ roomID: RoomID) {
         guard let rooms else { return }
         Task { @NexoActor in rooms.leave(roomID) }
+    }
+
+    /// Lleva el perfil completo a la identidad y a las salas unidas. Sin identidad
+    /// no hay nada que actualizar: se aplica cuando se lee.
+    private func applyProfile(republishes: Bool) async {
+        guard let identity else { return }
+        await Self.updateProfile(
+            identity,
+            displayName: localDisplayName,
+            avatar: avatar,
+            photo: photoDigest == nil ? nil : photo,
+            photoDigest: photoDigest,
+            rooms: stack?.rooms
+        )
+        if republishes { await stack?.republishAdvertisement() }
+    }
+
+    @NexoActor
+    private static func updateProfile(
+        _ identity: LocalIdentity,
+        displayName: String,
+        avatar: String?,
+        photo: URL?,
+        photoDigest: String?,
+        rooms: RoomService?
+    ) {
+        identity.displayName = displayName
+        identity.avatar = avatar
+        identity.photoURL = photo
+        identity.photoDigest = photoDigest
+        rooms?.publishLocalProfile()
     }
 
     // MARK: - Reconciliación
@@ -287,7 +339,11 @@ public final class NexoRuntime<RoomState: Sendable> {
             return
         }
 
-        if identity == nil { identity = await loadIdentityOffMain() }
+        if identity == nil {
+            identity = await loadIdentityOffMain()
+            // The photo may have been set while the identity was unavailable.
+            await applyProfile(republishes: false)
+        }
         guard let identity else {
             state = .unavailable(.identity)
             return
@@ -572,15 +628,6 @@ public final class NexoRuntime<RoomState: Sendable> {
             await Self.publish(identity: identity, transport: transport, rooms: rooms)
         }
 
-        func setDisplayName(_ name: String) async {
-            await Self.update(identity) { $0.displayName = name }
-            await republishAdvertisement()
-        }
-
-        func setAvatar(_ avatar: String?) async {
-            await Self.update(identity) { $0.avatar = avatar }
-        }
-
         // MARK: Trabajo en NexoActor
 
         @NexoActor
@@ -630,11 +677,6 @@ public final class NexoRuntime<RoomState: Sendable> {
                 rooms: rooms.advertisedRoomDescriptors,
                 totalRoomCount: rooms.hostedRooms.count
             ))
-        }
-
-        @NexoActor
-        private static func update(_ identity: LocalIdentity, _ change: @NexoActor @Sendable (LocalIdentity) -> Void) {
-            change(identity)
         }
 
         @NexoActor

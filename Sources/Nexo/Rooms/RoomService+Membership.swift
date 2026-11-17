@@ -148,9 +148,56 @@ extension RoomService {
             deviceID: request.deviceID,
             displayName: request.displayName,
             avatar: request.avatar,
+            photoDigest: request.photoDigest,
             to: session,
             requestID: request.requestID
         )
+    }
+
+    // MARK: - Perfil
+
+    /// Lleva el perfil local a las salas unidas. El host reescribe su propia
+    /// entrada; un invitado se lo pide a su host. Las salas que se están
+    /// recuperando lo reciben con la petición de re-entrada.
+    func publishLocalProfile() {
+        for session in sessions.values where session.accessState == .joined {
+            if session.isLocalHost {
+                refreshProfile(
+                    of: identity.deviceID,
+                    displayName: identity.displayName,
+                    avatar: identity.avatar,
+                    photoDigest: identity.photoDigest,
+                    in: session
+                )
+            } else {
+                send(
+                    .profileChanged(identity.member(role: .guest)),
+                    to: [session.descriptor.hostDeviceID],
+                    roomID: session.roomID
+                )
+            }
+        }
+    }
+
+    /// Solo el host. Mantiene el rol y avisa a la sala si algo cambió.
+    func refreshProfile(
+        of deviceID: DeviceID,
+        displayName: String,
+        avatar: String?,
+        photoDigest: String?,
+        in session: Room
+    ) {
+        guard session.isLocalHost, let current = session.member(deviceID) else { return }
+        let updated = RoomMember(
+            deviceID: deviceID,
+            displayName: displayName,
+            role: current.role,
+            avatar: RoomMember.validAvatar(avatar),
+            photoDigest: RoomMember.validPhotoDigest(photoDigest)
+        )
+        guard updated != current else { return }
+        apply(session.members.map { $0.deviceID == deviceID ? updated : $0 }, to: session)
+        sendMembership(of: session, to: session.remoteMembers.map(\.deviceID))
     }
 
     // MARK: - Membresía entrante
@@ -169,8 +216,16 @@ extension RoomService {
             return
         }
 
-        // Un miembro reconectando que ya estaba aquí: reafirma la membresía.
+        // Un miembro reconectando que ya estaba aquí: reafirma la membresía con
+        // el perfil que trae, que pudo cambiar mientras estaba fuera.
         if session.contains(peer.deviceID) {
+            refreshProfile(
+                of: peer.deviceID,
+                displayName: payload.displayName,
+                avatar: payload.avatar,
+                photoDigest: payload.photoDigest,
+                in: session
+            )
             sendAcceptance(of: session, to: peer.deviceID, requestID: payload.requestID)
             return
         }
@@ -194,6 +249,7 @@ extension RoomService {
                 deviceID: peer.deviceID,
                 displayName: payload.displayName,
                 avatar: payload.avatar,
+                photoDigest: payload.photoDigest,
                 to: session,
                 requestID: payload.requestID
             )
@@ -208,7 +264,8 @@ extension RoomService {
                 roomID: payload.roomID,
                 deviceID: peer.deviceID,
                 displayName: payload.displayName,
-                avatar: payload.avatar,
+                avatar: RoomMember.validAvatar(payload.avatar),
+                photoDigest: RoomMember.validPhotoDigest(payload.photoDigest),
                 requestID: payload.requestID,
                 connectionSessionID: peer.connectionSessionID
             )
@@ -255,6 +312,7 @@ extension RoomService {
         deviceID: DeviceID,
         displayName: String,
         avatar: String?,
+        photoDigest: String?,
         to session: Room,
         requestID: UUID?
     ) {
@@ -264,7 +322,8 @@ extension RoomService {
                 deviceID: deviceID,
                 displayName: displayName,
                 role: .guest,
-                avatar: avatar
+                avatar: RoomMember.validAvatar(avatar),
+                photoDigest: RoomMember.validPhotoDigest(photoDigest)
             ))
         }
         apply(members, to: session)
@@ -450,6 +509,7 @@ extension RoomService {
                 roomID: roomID,
                 displayName: identity.displayName,
                 avatar: identity.avatar,
+                photoDigest: identity.photoDigest,
                 requestID: requestID
             )),
             to: [deviceID],

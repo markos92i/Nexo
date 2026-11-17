@@ -6,8 +6,8 @@ import Foundation
 /// framework. Se negocia durante el handshake, antes de admitir ningún envelope.
 public enum ProtocolInfo {
 
-    public static let currentVersion: UInt8 = 1
-    public static let minimumVersion: UInt8 = 1
+    public static let currentVersion: UInt8 = 2
+    public static let minimumVersion: UInt8 = 2
 
     /// Capacidades anunciadas en el `hello`. Permiten desplegar funciones nuevas
     /// sin romper peers antiguos: una capacidad no soportada simplemente no se usa.
@@ -82,6 +82,11 @@ public enum Limits {
     /// Chunks en vuelo antes de esperar backpressure del receptor.
     public static let transferWindowChunks = 8
     public static let chatHistoryLimit = 500
+
+    /// The avatar token travels in every member list, so it must stay a thumbnail.
+    public static let maximumAvatarTokenBytes = 24 * 1024
+    /// Profile photos travel on demand over a byte stream, never in a member list.
+    public static let maximumPhotoBytes = 2 * 1024 * 1024
 
     /// Cuánto tiempo una desconexión física se sigue considerando recuperable.
     /// También se comprueba al volver a primer plano, ya que iOS puede suspender

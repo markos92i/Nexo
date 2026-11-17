@@ -17,6 +17,9 @@ public final class LocalIdentity {
     /// Token de avatar opaco (clave de catálogo o miniatura codificada) publicado
     /// a los peers junto al nombre visible.
     public var avatar: String?
+    /// Foto de perfil completa que se sirve a quien la pida, y su SHA-256.
+    public internal(set) var photoURL: URL?
+    public internal(set) var photoDigest: String?
 
     nonisolated init(deviceID: DeviceID, displayName: String, avatar: String? = nil) {
         self.deviceID = deviceID
@@ -48,7 +51,8 @@ public final class LocalIdentity {
             deviceID: deviceID,
             displayName: displayName,
             role: role,
-            avatar: avatar
+            avatar: avatar,
+            photoDigest: photoDigest
         )
     }
 }

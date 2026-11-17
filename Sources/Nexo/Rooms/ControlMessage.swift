@@ -31,6 +31,15 @@ public enum ControlMessage: Codable, Sendable {
     case chatHistory(ChatHistoryPayload)
     case roomClosed(RoomClosedPayload)
 
+    // MARK: Perfil
+
+    /// Un invitado avisa a su host de que cambió su perfil. El host solo toma
+    /// nombre, avatar y `photoDigest`; el rol lo conserva él.
+    case profileChanged(RoomMember)
+    /// Pide la foto con este digest. Se responde con un stream binario de tipo
+    /// `ByteStreamDescriptor.photoMimeType`.
+    case photoRequest(String)
+
     // MARK: Actividades
 
     case activityStarted(ActivityLifecyclePayload)
@@ -53,6 +62,7 @@ public enum ControlMessage: Codable, Sendable {
         case .roomHostChanged(let payload): payload.descriptor.id
         case .chatHistory(let payload): payload.roomID
         case .roomClosed(let payload): payload.roomID
+        case .profileChanged, .photoRequest: nil
         case .activityStarted(let payload), .activityInvite(let payload),
              .activityJoinAccepted(let payload): payload.descriptor.roomID
         case .activityJoinRequest(let payload), .activityLeft(let payload): payload.roomID
@@ -80,13 +90,21 @@ public struct JoinRoomRequestPayload: Codable, Sendable {
     public let roomID: RoomID
     public let displayName: String
     public let avatar: String?
+    public let photoDigest: String?
     /// Lo reenvía el host; una respuesta nunca debe completar un intento de join posterior.
     public let requestID: UUID?
 
-    public init(roomID: RoomID, displayName: String, avatar: String? = nil, requestID: UUID? = nil) {
+    public init(
+        roomID: RoomID,
+        displayName: String,
+        avatar: String? = nil,
+        photoDigest: String? = nil,
+        requestID: UUID? = nil
+    ) {
         self.roomID = roomID
         self.displayName = displayName
         self.avatar = avatar
+        self.photoDigest = photoDigest
         self.requestID = requestID
     }
 }

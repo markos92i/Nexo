@@ -154,6 +154,8 @@ public final class RoomService {
     var receivedEnvelopeIDs: Set<ReceivedEnvelopeKey> = []
     var receivedEnvelopeOrder: [ReceivedEnvelopeKey] = []
     let directoryRequestRoomID = RoomID()
+    /// Fotos de perfil en caché, descargas y envíos en curso.
+    let photos = PhotoCache()
 
     private var noticeContinuations: [UUID: AsyncStream<RoomNotice>.Continuation] = [:]
     private var snapshotContinuations: [UUID: AsyncStream<RoomsSnapshot>.Continuation] = [:]
@@ -372,6 +374,10 @@ public final class RoomService {
             // Dejar de iterar el stream lo cancela y avisa al emisor.
             return
         }
+        guard incoming.descriptor.mimeType != ByteStreamDescriptor.photoMimeType else {
+            receivePhoto(incoming)
+            return
+        }
         incomingByteStreamPair.continuation.yield(incoming)
     }
 
@@ -409,6 +415,7 @@ public final class RoomService {
         incomingByteStreamPair.continuation.finish()
         for task in recoveryTasks.values { task.cancel() }
         for task in hostMigrationTasks.values { task.cancel() }
+        photos.cancelAll()
         for continuation in noticeContinuations.values { continuation.finish() }
         for continuation in snapshotContinuations.values { continuation.finish() }
         for continuation in transportEventContinuations.values { continuation.finish() }
@@ -491,6 +498,7 @@ public final class RoomService {
         recoveryDeadlines.removeAll()
         for task in hostMigrationTasks.values { task.cancel() }
         hostMigrationTasks.removeAll()
+        photos.cancelAll()
 
         for session in sessions.values {
             transfers?.cancelAll(in: session)
@@ -536,7 +544,8 @@ public final class RoomService {
         to deviceID: DeviceID,
         in roomID: RoomID,
         mimeType: String = "application/octet-stream",
-        name: String? = nil
+        name: String? = nil,
+        expectedLength: Int64? = nil
     ) async throws -> ByteStreamWriter {
         guard let session = sessions[roomID] else { throw RoomError.roomNotFound }
         guard session.accessState == .joined else { throw RoomError.notAMember }
@@ -544,7 +553,9 @@ public final class RoomService {
         guard let binary = binaryTransport else {
             throw RoomError.transportFailure(.binaryStreamsUnsupported)
         }
-        let descriptor = ByteStreamDescriptor(roomID: roomID, mimeType: mimeType, name: name)
+        let descriptor = ByteStreamDescriptor(
+            roomID: roomID, mimeType: mimeType, name: name, expectedLength: expectedLength
+        )
         let result: Result<ByteStreamWriter, TransportError>
         do {
             result = .success(try await binary.openByteStream(to: deviceID, descriptor: descriptor))
