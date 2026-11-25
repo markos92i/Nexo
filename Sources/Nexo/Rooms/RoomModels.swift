@@ -136,6 +136,9 @@ public struct RoomDescriptor: Codable, Hashable, Sendable, Identifiable {
     /// Actividad principal prevista. Una sala de juego la declara para que el
     /// descubrimiento pueda filtrar por juego sin conectar.
     public var activityKind: ActivityKind?
+    /// Estado de la actividad viva, que el host anuncia para que se vea sin conectar si
+    /// una partida espera jugadores o ya ha empezado. `nil` sin actividad.
+    public var activityState: ActivityState?
     public var accessPolicy: RoomAccessPolicy
     public var memberCount: Int
     /// `nil` significa que el producto no declaró límite.
@@ -148,6 +151,7 @@ public struct RoomDescriptor: Codable, Hashable, Sendable, Identifiable {
         hostDeviceID: DeviceID,
         features: RoomFeatures,
         activityKind: ActivityKind? = nil,
+        activityState: ActivityState? = nil,
         accessPolicy: RoomAccessPolicy = .open,
         memberCount: Int = 1,
         capacity: Int? = nil,
@@ -160,6 +164,7 @@ public struct RoomDescriptor: Codable, Hashable, Sendable, Identifiable {
         self.hostGeneration = hostGeneration
         self.features = features
         self.activityKind = activityKind
+        self.activityState = activityState
         self.accessPolicy = accessPolicy
         self.memberCount = memberCount
         self.capacity = capacity
@@ -167,7 +172,7 @@ public struct RoomDescriptor: Codable, Hashable, Sendable, Identifiable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, hostDeviceID, hostGeneration, features, activityKind
+        case id, name, hostDeviceID, hostGeneration, features, activityKind, activityState
         case accessPolicy, memberCount, capacity, protocolVersion
     }
 
@@ -179,6 +184,7 @@ public struct RoomDescriptor: Codable, Hashable, Sendable, Identifiable {
         hostGeneration = try container.decodeIfPresent(UInt64.self, forKey: .hostGeneration) ?? 0
         features = try container.decode(RoomFeatures.self, forKey: .features)
         activityKind = try container.decodeIfPresent(ActivityKind.self, forKey: .activityKind)
+        activityState = try container.decodeIfPresent(ActivityState.self, forKey: .activityState)
         accessPolicy = try container.decode(RoomAccessPolicy.self, forKey: .accessPolicy)
         memberCount = try container.decode(Int.self, forKey: .memberCount)
         capacity = try container.decodeIfPresent(Int.self, forKey: .capacity)

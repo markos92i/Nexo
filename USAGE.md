@@ -358,6 +358,13 @@ se entregan en orden al primer lector. Por ejemplo, si otro jugador marca "listo
 mientras tu vista aún se está montando, ese evento no se pierde, así que no hace
 falta reenviar el estado cada pocos segundos por si alguien no lo recibió.
 
+Una sala de chat puede alojar una partida sin crear otra sala. Mientras dure, el
+host anuncia en el descubrimiento el tipo y el estado de esa actividad
+(`DiscoveredRoom.activityKind` y `descriptor.activityState`): los demás ven sin
+conectar si la partida espera jugadores (`.lobby`) o ya ha empezado (`.running`).
+Quien entra en la sala mientras la actividad está en `.lobby` queda admitido en
+ella automáticamente.
+
 ---
 
 ## Streams binarios

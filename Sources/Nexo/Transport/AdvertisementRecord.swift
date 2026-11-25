@@ -103,7 +103,8 @@ public struct AdvertisementRecord: Sendable, Equatable {
 
 /// Codificación compacta de un `RoomDescriptor` para el TXT.
 ///
-/// Formato: `id|features|policy|members|capacity|activityKind|hostID|name`.
+/// Formato: `id|features|policy|members|capacity|activityKind|hostID|name|activityState`.
+/// El estado va detrás del nombre para que un anuncio de 8 campos siga siendo válido.
 /// El nombre va al final y percent-escaped, así que un `|` dentro nunca rompe el parseo.
 private struct CompactRoom {
     let id: RoomID
@@ -114,6 +115,7 @@ private struct CompactRoom {
     let memberCount: Int
     let capacity: Int?
     let activityKind: ActivityKind?
+    let activityState: ActivityState?
 
     private static let separator: Character = "|"
     private static let allowedNameCharacters = CharacterSet.alphanumerics.union(.whitespaces)
@@ -131,6 +133,7 @@ private struct CompactRoom {
         self.memberCount = descriptor.memberCount
         self.capacity = descriptor.capacity
         self.activityKind = descriptor.activityKind
+        self.activityState = descriptor.activityState
     }
 
     var encoded: String {
@@ -150,8 +153,9 @@ private struct CompactRoom {
         // El recorte se hace sobre bytes ya escapados, no caracteres: un
         // carácter acentuado o emoji puede ocupar 6-12 bytes una vez escapado, y
         // pasarse del presupuesto haría que Bonjour descarte la entrada.
-        let budget = Self.maximumEntryBytes - prefix.utf8.count
-        return prefix + Self.escapedName(name, maximumBytes: budget)
+        let suffix = String(Self.separator) + (activityState?.rawValue ?? "")
+        let budget = Self.maximumEntryBytes - prefix.utf8.count - suffix.utf8.count
+        return prefix + Self.escapedName(name, maximumBytes: budget) + suffix
     }
 
     /// Escapa el nombre dentro de un presupuesto de bytes, sin partir un carácter.
@@ -184,7 +188,7 @@ private struct CompactRoom {
             omittingEmptySubsequences: false
         ).map(String.init)
 
-        guard fields.count == 8,
+        guard fields.count == 8 || fields.count == 9,
               let roomID = RoomID(string: fields[0]),
               let rawFeatures = UInt16(fields[1]),
               let policy = RoomAccessPolicy(rawValue: fields[2]),
@@ -199,6 +203,7 @@ private struct CompactRoom {
         self.activityKind = fields[5].isEmpty ? nil : ActivityKind(fields[5])
         self.hostDeviceID = hostDeviceID
         self.name = fields[7].removingPercentEncoding ?? fields[7]
+        self.activityState = fields.count == 9 ? ActivityState(rawValue: fields[8]) : nil
     }
 
     func descriptor(protocolVersion: UInt8) -> RoomDescriptor {
@@ -208,6 +213,7 @@ private struct CompactRoom {
             hostDeviceID: hostDeviceID,
             features: features,
             activityKind: activityKind,
+            activityState: activityState,
             accessPolicy: accessPolicy,
             memberCount: memberCount,
             capacity: capacity,

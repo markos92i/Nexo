@@ -284,11 +284,11 @@ public final class RoomService {
     /// termine.
     public var advertisedRoomDescriptors: [RoomDescriptor] {
         hostedRooms.map { session in
-            guard session.descriptor.activityKind == nil,
-                  let liveKind = session.liveActivityKind else { return session.descriptor }
-
             var descriptor = session.descriptor
-            descriptor.activityKind = liveKind
+            if descriptor.activityKind == nil {
+                descriptor.activityKind = session.liveActivityKind
+            }
+            descriptor.activityState = session.primaryActivity?.descriptor.state
             return descriptor
         }
     }
@@ -595,6 +595,11 @@ public final class RoomService {
         )
         if let transfers {
             session.bindTransfers(transfers)
+        }
+        // Que una partida pase de esperar jugadores a empezar cambia lo que se anuncia.
+        session.onActivityChange = { [weak self, weak session] in
+            guard let session else { return }
+            self?.republishIfHosting(session)
         }
         session.onJoinRequestsRemoved = { [weak self] removed in
             for request in removed {

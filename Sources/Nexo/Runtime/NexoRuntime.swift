@@ -689,7 +689,6 @@ public final class NexoRuntime<RoomState: Sendable> {
     }
 }
 
-#if DEBUG
 // MARK: - Previews
 
 extension NexoRuntime {
@@ -737,4 +736,3 @@ final class PreviewTransport: Transport {
         throw .peerNotDiscovered
     }
 }
-#endif

@@ -310,6 +310,8 @@ public final class Room: Identifiable {
     /// Avisa al servicio de cada solicitud que sale de la cola, sea cual sea el
     /// motivo, para que publique `RoomNotice.joinRequestResolved`.
     var onJoinRequestsRemoved: (@NexoActor ([RoomJoinRequest]) -> Void)?
+    /// Se llama cuando cambia el descriptor de una actividad, para republicar el anuncio.
+    var onActivityChange: (@NexoActor () -> Void)?
 
     func removeJoinRequest(_ id: UUID) -> RoomJoinRequest? {
         guard let index = pendingJoinRequests.firstIndex(where: { $0.id == id }) else { return nil }
@@ -340,7 +342,10 @@ public final class Room: Identifiable {
 
     func register(_ activity: any Activity) {
         activities[activity.descriptor.id] = activity
-        activity.onDescriptorChange = { [weak self] in self?.publishSnapshot() }
+        activity.onDescriptorChange = { [weak self] in
+            self?.publishSnapshot()
+            self?.onActivityChange?()
+        }
         publishSnapshot()
     }
 
